@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Dict, Any, List, Optional, Tuple
 import ipaddress
 import os
+import random
 
 # Наши утилиты
 from core.docker import run_cmd
@@ -223,6 +224,43 @@ def _wg_remove_peer_by_pubkey(pubkey: str) -> bool:
     return ok_run and (rc2 == 0)
 
 
+def _read_interface_obf_params() -> dict:
+    """
+    Try to read Jc/Jmin/Jmax/S1/S2 and optionally H1..H4 from the server Interface block
+    in CONF_PATH. Returns dict with any found integer values.
+    """
+    try:
+        cfg = _require_ok(f"cat {CONF_PATH}")
+    except Exception:
+        return {}
+    res = {}
+    for line in cfg.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, v = [x.strip() for x in s.split("=", 1)]
+        if k in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
+            try:
+                res[k] = int(v)
+            except Exception:
+                pass
+    return res
+
+
+def _gen_awg_obf_params() -> dict:
+    """Generate reasonable AWG obfuscation params and distinct H1..H4."""
+    jc = random.randint(3, 8)
+    jmin = random.randint(30, 60)
+    jmax = random.randint(max(70, jmin + 10), 1200)
+    s1 = random.randint(0, 100)
+    s2 = random.randint(0, 100)
+    hs = set()
+    while len(hs) < 4:
+        hs.add(random.randint(1, 2**31 - 1))
+    h1, h2, h3, h4 = list(hs)
+    return {"Jc": jc, "Jmin": jmin, "Jmax": jmax, "S1": s1, "S2": s2, "H1": h1, "H2": h2, "H3": h3, "H4": h4}
+
+
 # ==== публичный API (используется bot.py) ====
 
 
@@ -369,6 +407,27 @@ def add_user(tid: int, name: str) -> Dict[str, Any]:
     _wg_add_peer(cli_pub, str(client_ip))
 
     # серверный публичный ключ и общий PSK
+    # determine AWG obfuscation params: prefer server interface values for J*/S*; generate distinct H* per client
+    iface_params = _read_interface_obf_params()
+    if iface_params:
+        # use server Jc/Jmin/Jmax/S1/S2 if present, otherwise generate defaults
+        awg_params = {
+            "Jc": iface_params.get("Jc", None),
+            "Jmin": iface_params.get("Jmin", None),
+            "Jmax": iface_params.get("Jmax", None),
+            "S1": iface_params.get("S1", None),
+            "S2": iface_params.get("S2", None),
+        }
+        # generate H1..H4 per-client to keep them unique
+        gen = _gen_awg_obf_params()
+        awg_params.update({k: gen[k] for k in ("H1", "H2", "H3", "H4")})
+        # fill missing J*/S* with generated defaults if any None
+        for k in ("Jc","Jmin","Jmax","S1","S2"):
+            if awg_params.get(k) is None:
+                awg_params[k] = gen[k if k in gen else k]
+    else:
+        awg_params = _gen_awg_obf_params()
+
     srv_pub = _server_public_key()
     psk = _require_ok(f"cat {PSK_PATH}").strip()
 
@@ -380,7 +439,16 @@ def add_user(tid: int, name: str) -> Dict[str, Any]:
         "[Interface]\n"
         f"PrivateKey = {cli_priv}\n"
         f"Address = {client_ip_cidr}\n"
-        "DNS = 1.1.1.1\n"
+        f"DNS = 1.1.1.1\n"
+        f"Jc = {awg_params['Jc']}\n"
+        f"Jmin = {awg_params['Jmin']}\n"
+        f"Jmax = {awg_params['Jmax']}\n"
+        f"S1 = {awg_params['S1']}\n"
+        f"S2 = {awg_params['S2']}\n"
+        f"H1 = {awg_params['H1']}\n"
+        f"H2 = {awg_params['H2']}\n"
+        f"H3 = {awg_params['H3']}\n"
+        f"H4 = {awg_params['H4']}\n"
         "\n"
         "[Peer]\n"
         f"PublicKey = {srv_pub}\n"
