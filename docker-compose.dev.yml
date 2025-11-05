@@ -1,0 +1,21 @@
+# ==================== AMNEZIA VPN BOT — DEV OVERRIDE ====================
+# Этот файл включаем ДОПОЛНИТЕЛЬНО к базовому docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# Отличия dev:
+#   - Монтируем исходники с хоста (./src:/app) для горячей правки кода.
+#   - Лимит памяти задаём через mem_limit (в dev это поддерживается всегда).
+# Всё остальное (proxy, секреты, sandbox) — как в проде.
+# ========================================================================
+
+services:
+  awgbot:
+    # Подменяем/добавляем только то, что нужно в dev
+    volumes:
+      - ./src:/app # правим код на лету
+      - ./data:/app/data # состояние
+      - ./secret.env:/run/secrets/secret.env:ro # один файл со всеми секретами
+
+    # В dev надёжнее использовать mem_limit (работает в обычном docker compose)
+    mem_limit: 256m # защитимся от убегающей памяти при отладке
+    # DOCKER_HOST берётся из базового compose (tcp://docker-proxy:2375)
+    # read_only/tmpfs/security_opt — остаются из базового compose

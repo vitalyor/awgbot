@@ -1,0 +1,27 @@
+# === Runtime data ===
+data/
+
+# === Secrets ===
+secret.env
+secrets/
+.env
+
+# === Python cache ===
+__pycache__/
+*.pyc
+*.pyo
+
+# === Logs & backups ===
+*.log
+*.gz
+*.tgz
+awgbot.backups/
+
+# === Editor & system ===
+.vscode/
+.idea/
+.DS_Store
+.cache/
+
+# === Optional ===
+# можно убрать, если хочешь хранить .env.example
