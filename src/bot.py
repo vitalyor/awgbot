@@ -9,6 +9,7 @@ from pathlib import Path
 # --- загрузка secret.env ДО любых импортов util/xray/awg и ДО чтения TOKEN ---
 SECRETS_FILE = "/run/secrets/secret.env"
 
+
 def load_env_kv_file(path: str, overwrite: bool = True) -> None:
     if not os.path.exists(path):
         return
@@ -28,6 +29,7 @@ def load_env_kv_file(path: str, overwrite: bool = True) -> None:
     except Exception:
         pass
 
+
 def _fallback_get_from_file(path: str, key: str) -> str | None:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -42,12 +44,15 @@ def _fallback_get_from_file(path: str, key: str) -> str | None:
         pass
     return None
 
+
 load_env_kv_file(SECRETS_FILE, overwrite=True)
 
 ERROR_NOTIFY_COOLDOWN_SEC = int(os.getenv("ERROR_NOTIFY_COOLDOWN_SEC", "600"))
 
 from logger_setup import get_logger
+
 logger = get_logger()
+
 
 def ensure_rid(context) -> str:
     rid = context.chat_data.get("_rid") if getattr(context, "chat_data", None) else None
@@ -59,37 +64,51 @@ def ensure_rid(context) -> str:
             pass
     return rid
 
+
 def _cmd_name_from_update(update) -> str:
     try:
         if getattr(update, "message", None) and update.message and update.message.text:
             return (update.message.text.split()[0] or "").strip()
-        if getattr(update, "callback_query", None) and update.callback_query and update.callback_query.data:
+        if (
+            getattr(update, "callback_query", None)
+            and update.callback_query
+            and update.callback_query.data
+        ):
             return f"[cb] {update.callback_query.data}"
     except Exception:
         pass
     return "(unknown)"
+
 
 # ===== декоратор логирования с антидублем для callback =====
 def log_command(fn):
     from functools import wraps
 
     @wraps(fn)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+    async def wrapper(
+        update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs
+    ):
         # --- АНТИДУБЛЬ ДЛЯ callback_query (как было) ---
         try:
             q = getattr(update, "callback_query", None)
-            allow_nested = bool(getattr(context, "chat_data", {})) and bool(context.chat_data.get("_allow_nested_from_cb", False))
+            allow_nested = bool(getattr(context, "chat_data", {})) and bool(
+                context.chat_data.get("_allow_nested_from_cb", False)
+            )
 
             if q is not None and not allow_nested:
                 key = (
                     update.effective_chat.id if update.effective_chat else 0,
                     q.message.message_id if getattr(q, "message", None) else 0,
-                    (q.data or "")
+                    (q.data or ""),
                 )
                 now_ts = time.time()
                 last = context.chat_data.get("_last_cb2")
                 debounce = CB_DEBOUNCE_MS / 1000.0
-                if last and last.get("key") == key and (now_ts - last.get("ts", 0)) < debounce:
+                if (
+                    last
+                    and last.get("key") == key
+                    and (now_ts - last.get("ts", 0)) < debounce
+                ):
                     return
                 context.chat_data["_last_cb2"] = {"key": key, "ts": now_ts}
             if allow_nested:
@@ -105,7 +124,9 @@ def log_command(fn):
         try:
             msg = getattr(update, "message", None)
             if msg and msg.text and msg.text.startswith("/"):
-                cmd_token = (msg.text.split()[0] or "").strip()  # ровно имя команды, без аргументов
+                cmd_token = (
+                    msg.text.split()[0] or ""
+                ).strip()  # ровно имя команды, без аргументов
                 chat_id = update.effective_chat.id if update.effective_chat else 0
                 key = (chat_id, cmd_token)
 
@@ -113,7 +134,11 @@ def log_command(fn):
                 last = context.chat_data.get("_last_cmd")
                 debounce = CMD_DEBOUNCE_MS / 1000.0
 
-                if last and last.get("key") == key and (now_ts - last.get("ts", 0)) < debounce:
+                if (
+                    last
+                    and last.get("key") == key
+                    and (now_ts - last.get("ts", 0)) < debounce
+                ):
                     # мягко игнорируем повтор той же команды
                     return
 
@@ -123,7 +148,9 @@ def log_command(fn):
         # --- /АНТИДУБЛЬ команд ---
 
         # ⬇️ Одноразовое подавление логов (как было)
-        suppress = bool(getattr(context, "chat_data", {})) and bool(context.chat_data.pop("_suppress_log_once", False))
+        suppress = bool(getattr(context, "chat_data", {})) and bool(
+            context.chat_data.pop("_suppress_log_once", False)
+        )
 
         rid = ensure_rid(context)
         cmd = _cmd_name_from_update(update)
@@ -137,18 +164,37 @@ def log_command(fn):
             pass
 
         if not suppress:
-            logger.info({"event": "cmd_start", "rid": rid, "uid": uid, "uname": uname, "cmd": cmd})
+            logger.info(
+                {
+                    "event": "cmd_start",
+                    "rid": rid,
+                    "uid": uid,
+                    "uname": uname,
+                    "cmd": cmd,
+                }
+            )
         t0 = time.time()
         try:
             res = await fn(update, context, *args, **kwargs)
             dt = int((time.time() - t0) * 1000)
             if not suppress:
-                logger.info({"event": "cmd_ok", "rid": rid, "uid": uid, "cmd": cmd, "ms": dt})
+                logger.info(
+                    {"event": "cmd_ok", "rid": rid, "uid": uid, "cmd": cmd, "ms": dt}
+                )
             return res
         except Exception:
             dt = int((time.time() - t0) * 1000)
             if not suppress:
-                logger.error({"event": "cmd_error", "rid": rid, "uid": uid, "cmd": cmd, "ms": dt}, exc_info=True)
+                logger.error(
+                    {
+                        "event": "cmd_error",
+                        "rid": rid,
+                        "uid": uid,
+                        "cmd": cmd,
+                        "ms": dt,
+                    },
+                    exc_info=True,
+                )
             raise
 
     return wrapper
@@ -164,6 +210,7 @@ def _is_command_message(update) -> bool:
     except Exception:
         return False
 
+
 async def _delete_user_message_if_command(update, context) -> None:
     if not _is_command_message(update):
         return
@@ -176,12 +223,15 @@ async def _delete_user_message_if_command(update, context) -> None:
         # тихо игнорим (нет прав, TTL и т.п.)
         pass
 
+
 def autoclean_command_input(fn):
     @wraps(fn)
     async def wrapper(update, context, *args, **kwargs):
         await _delete_user_message_if_command(update, context)
         return await fn(update, context, *args, **kwargs)
+
     return wrapper
+
 
 # ========= АДМИНКА =========
 def admin_only(fn):
@@ -191,12 +241,15 @@ def admin_only(fn):
         uid = update.effective_user.id if update and update.effective_user else None
         cmd = _cmd_name_from_update(update)
         if ADMIN_IDS and uid not in ADMIN_IDS:
-            logger.warning({"event": "access_denied", "rid": rid, "uid": uid, "cmd": cmd})
+            logger.warning(
+                {"event": "access_denied", "rid": rid, "uid": uid, "cmd": cmd}
+            )
             try:
                 return await update.effective_message.reply_text("⛔ Доступ запрещён.")
             except Exception:
                 return
         return await fn(update, context)
+
     return wrapper
 
 
@@ -207,24 +260,42 @@ def with_request_id(fn):
         context.chat_data["_rid"] = rid
         context.args = getattr(context, "args", [])
         return await fn(update, context, *args, **kwargs)
+
     return wrapper
 
 
 # --- теперь можно импортировать ---
-from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram import (
+    Update,
+    InputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 from util import XRAY_CONNECT_HOST, AWG_CONNECT_HOST
 import xray as XR
 import awg as AWG
 
 SAFE_TXT = "\u2060"  # невидимый символ
 
+
 def _salt_text(txt: str) -> str:
     # гарантируем, что текст байтово отличается; визуально это не видно
     n = int((time.time() * 100) % 7) + 1  # 1..7
     return txt + (SAFE_TXT * n)
 
-async def _edit_cb_with_fallback(update, context, text: str, *, kb=None, parse_mode="HTML"):
+
+async def _edit_cb_with_fallback(
+    update, context, text: str, *, kb=None, parse_mode="HTML"
+):
     q = update.callback_query
     chat_id = update.effective_chat.id if update.effective_chat else None
     last_id = context.chat_data.get("last_status_msg_id")
@@ -248,8 +319,7 @@ async def _edit_cb_with_fallback(update, context, text: str, *, kb=None, parse_m
             # удаляем исходное сообщение (исправлено: берём chat.id)
             try:
                 await context.bot.delete_message(
-                    chat_id=q.message.chat.id,
-                    message_id=q.message.message_id
+                    chat_id=q.message.chat.id, message_id=q.message.message_id
                 )
             except Exception:
                 pass
@@ -304,7 +374,9 @@ async def _edit_cb_with_fallback(update, context, text: str, *, kb=None, parse_m
                         disable_web_page_preview=True,
                     )
                 except Exception as e2b:
-                    logger.warning({"event": "edit_by_id_retry_fail", "error": str(e2b)})
+                    logger.warning(
+                        {"event": "edit_by_id_retry_fail", "error": str(e2b)}
+                    )
             logger.warning({"event": "edit_by_id_fail", "error": str(e2)})
 
     # 4) На крайний случай — отправляем новое сообщение
@@ -320,59 +392,80 @@ async def _edit_cb_with_fallback(update, context, text: str, *, kb=None, parse_m
     except Exception as e3:
         logger.error({"event": "send_new_status_fail", "error": str(e3)})
         try:
-            await q.answer("Не удалось обновить сообщение. Проверь лог /logs.", show_alert=True)
+            await q.answer(
+                "Не удалось обновить сообщение. Проверь лог /logs.", show_alert=True
+            )
         except Exception:
             pass
         return None
 
-# --- а теперь читаем переменные с fallback ---
-TOKEN = os.getenv("TELEGRAM_TOKEN") or _fallback_get_from_file(SECRETS_FILE, "TELEGRAM_TOKEN")
-if not TOKEN:
-    raise SystemExit("TELEGRAM_TOKEN не задан (ожидался в .env или в /run/secrets/secret.env)")
 
-ADMIN_IDS_RAW = (os.getenv("ADMIN_IDS") or _fallback_get_from_file(SECRETS_FILE, "ADMIN_IDS") or "").strip()
+# --- а теперь читаем переменные с fallback ---
+TOKEN = os.getenv("TELEGRAM_TOKEN") or _fallback_get_from_file(
+    SECRETS_FILE, "TELEGRAM_TOKEN"
+)
+if not TOKEN:
+    raise SystemExit(
+        "TELEGRAM_TOKEN не задан (ожидался в .env или в /run/secrets/secret.env)"
+    )
+
+ADMIN_IDS_RAW = (
+    os.getenv("ADMIN_IDS") or _fallback_get_from_file(SECRETS_FILE, "ADMIN_IDS") or ""
+).strip()
 if not ADMIN_IDS_RAW:
-    raise SystemExit("ADMIN_IDS не задан (ожидался в .env или в /run/secrets/secret.env)")
+    raise SystemExit(
+        "ADMIN_IDS не задан (ожидался в .env или в /run/secrets/secret.env)"
+    )
 ADMIN_IDS = {int(tok) for tok in re.split(r"[,\s]+", ADMIN_IDS_RAW) if tok.isdigit()}
 if not ADMIN_IDS:
     raise SystemExit("ADMIN_IDS пуст или не содержит числовых ID")
 # ===== Watchdog настройки из ENV =====
 _BOOT_TS = time.time()
-WATCHDOG_ENABLED        = os.getenv("WATCHDOG_ENABLED", "1") == "1"
-WATCHDOG_INTERVAL_SEC   = int(os.getenv("WATCHDOG_INTERVAL_SEC", "300"))
-WATCHDOG_COOLDOWN_SEC   = int(os.getenv("WATCHDOG_COOLDOWN_SEC", "600"))
-WATCHDOG_AUTORESTART    = os.getenv("WATCHDOG_AUTORESTART", "0") == "1"
-HEARTBEAT_WARN_SEC      = int(os.getenv("HEARTBEAT_WARN_SEC", "120"))
-HEARTBEAT_CRIT_SEC      = int(os.getenv("HEARTBEAT_CRIT_SEC", "300"))
-WATCHDOG_TG_NOTIFY     = os.getenv("WATCHDOG_TG_NOTIFY", "1") == "1"
-WATCHDOG_TG_TIMEOUT    = int(os.getenv("WATCHDOG_TG_TIMEOUT", "5"))
+WATCHDOG_ENABLED = os.getenv("WATCHDOG_ENABLED", "1") == "1"
+WATCHDOG_INTERVAL_SEC = int(os.getenv("WATCHDOG_INTERVAL_SEC", "300"))
+WATCHDOG_COOLDOWN_SEC = int(os.getenv("WATCHDOG_COOLDOWN_SEC", "600"))
+WATCHDOG_AUTORESTART = os.getenv("WATCHDOG_AUTORESTART", "0") == "1"
+HEARTBEAT_WARN_SEC = int(os.getenv("HEARTBEAT_WARN_SEC", "120"))
+HEARTBEAT_CRIT_SEC = int(os.getenv("HEARTBEAT_CRIT_SEC", "300"))
+WATCHDOG_TG_NOTIFY = os.getenv("WATCHDOG_TG_NOTIFY", "1") == "1"
+WATCHDOG_TG_TIMEOUT = int(os.getenv("WATCHDOG_TG_TIMEOUT", "5"))
 WATCHDOG_BOOT_GRACE_SEC = int(os.getenv("WATCHDOG_BOOT_GRACE_SEC", "60"))
 
 
 # ===== /sync: фильтры и режимы =====
-SYNC_DEFAULT_FILTER = "all"      # all|absent|extra|suspended|diverged
-SYNC_DEFAULT_MODE   = "compact"  # compact|detailed
+SYNC_DEFAULT_FILTER = "all"  # all|absent|extra|suspended|diverged
+SYNC_DEFAULT_MODE = "compact"  # compact|detailed
 
 SYNC_FILTERS = {
-    "all":        "Все",
-    "absent":     "Только отсутствующие",
-    "extra":      "Только лишние в Xray",
-    "suspended":  "Только приостановленные",
-    "diverged":   "Только с расхождениями",
+    "all": "Все",
+    "absent": "Только отсутствующие",
+    "extra": "Только лишние в Xray",
+    "suspended": "Только приостановленные",
+    "diverged": "Только с расхождениями",
 }
 
 SYNC_MODE_LABEL = {
-    "compact":  "🧷 Компактный вид",
+    "compact": "🧷 Компактный вид",
     "detailed": "📋 Подробный вид",
 }
 
 # ===== Прочие настройки из ENV =====
-NOTIFY_USER_ON_ACCESS_CHANGE = os.getenv("NOTIFY_USER_ON_ACCESS_CHANGE", "1") == "1" # уведомлять юзера при изменении доступа
+NOTIFY_USER_ON_ACCESS_CHANGE = (
+    os.getenv("NOTIFY_USER_ON_ACCESS_CHANGE", "1") == "1"
+)  # уведомлять юзера при изменении доступа
 CB_DEBOUNCE_MS = int(os.getenv("CB_DEBOUNCE_MS", "2000"))  # антидубль для callback, мс
-STATUS_LOADER_COOLDOWN_SEC = int(os.getenv("STATUS_LOADER_COOLDOWN_SEC", "5"))  # как часто показывать "Загружаю ресурсы…"
+STATUS_LOADER_COOLDOWN_SEC = int(
+    os.getenv("STATUS_LOADER_COOLDOWN_SEC", "5")
+)  # как часто показывать "Загружаю ресурсы…"
 CMD_DEBOUNCE_MS = int(os.getenv("CMD_DEBOUNCE_MS", "1200"))  # антидубль для команд, мс
 
-logger.info({"event": "boot", "token_len": len(TOKEN), "env_token_in_env": bool(os.getenv("TELEGRAM_TOKEN"))})
+logger.info(
+    {
+        "event": "boot",
+        "token_len": len(TOKEN),
+        "env_token_in_env": bool(os.getenv("TELEGRAM_TOKEN")),
+    }
+)
 
 
 # Лимиты конфигураций: по 5 на каждый протокол (итого 10)
@@ -384,18 +477,22 @@ STATE_PATH = os.path.join(DATA_DIR, "state.json")
 HEARTBEAT_PATH = os.path.join(DATA_DIR, "heartbeat")
 
 
-
 # ========= УТИЛИТЫ (только локальные, без docker) =========
 
 
-def _notify_user_simple(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
+def _notify_user_simple(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str
+) -> None:
     if not NOTIFY_USER_ON_ACCESS_CHANGE:
         return
     try:
         # отправляем асинхронно через create_task, чтобы не блокировать текущий хэндлер
-        context.application.create_task(context.bot.send_message(chat_id=chat_id, text=text))
+        context.application.create_task(
+            context.bot.send_message(chat_id=chat_id, text=text)
+        )
     except Exception:
         pass
+
 
 def _cb_message_is_last(update, context) -> bool:
     """
@@ -407,12 +504,13 @@ def _cb_message_is_last(update, context) -> bool:
         if not q or not q.message:
             return True  # нет контекста — считаем последним, чтобы попробовать редактировать
         cb_mid = q.message.message_id
-        last_bot_mid  = int(context.user_data.get("last_bot_msg_id") or 0)
+        last_bot_mid = int(context.user_data.get("last_bot_msg_id") or 0)
         last_user_mid = int(context.chat_data.get("last_user_msg_id") or 0)
         last_known = max(last_bot_mid, last_user_mid)
         return last_known <= cb_mid
     except Exception:
         return True
+
 
 def now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -452,15 +550,20 @@ def load_state() -> Dict[str, Any]:
             changed = True
             continue
         if "allowed" not in rec:
-            rec["allowed"] = False; changed = True
+            rec["allowed"] = False
+            changed = True
         if "profiles" not in rec or not isinstance(rec.get("profiles"), list):
-            rec["profiles"] = []; changed = True
+            rec["profiles"] = []
+            changed = True
         if "username" not in rec:
-            rec["username"] = ""; changed = True
+            rec["username"] = ""
+            changed = True
         if "first_name" not in rec:
-            rec["first_name"] = ""; changed = True
+            rec["first_name"] = ""
+            changed = True
         if "created_at" not in rec:
-            rec["created_at"] = now_iso(); changed = True
+            rec["created_at"] = now_iso()
+            changed = True
     if changed:
         save_state(st)
     return st
@@ -547,6 +650,7 @@ def md_limit_reached(user: Dict[str, Any], typ: str) -> bool:
         return len(profiles_active_by_type(user, "amneziawg")) >= MAX_AWG
     return False
 
+
 def _iter_xray_profiles(user_rec: Dict[str, Any]):
     """Итерирует НЕудалённые Xray-профили пользователя (из state.json)."""
     for p in profiles_active(user_rec):
@@ -555,7 +659,9 @@ def _iter_xray_profiles(user_rec: Dict[str, Any]):
 
 
 # ===== СТАТУС ПРОФИЛЯ XRAY =====
-def xray_profile_status_for_user(user_rec: Dict[str, Any], tg_id: int, pname: str) -> tuple[str, str]:
+def xray_profile_status_for_user(
+    user_rec: Dict[str, Any], tg_id: int, pname: str
+) -> tuple[str, str]:
     """
     Возвращает (status, label):
       - ("active", "Активен ▶️")        — профиль есть в Xray и не помечен как suspended
@@ -563,7 +669,14 @@ def xray_profile_status_for_user(user_rec: Dict[str, Any], tg_id: int, pname: st
       - ("absent", "Отсутствует ⚠️")     — профиль не найден в Xray (удалён/рассинхрон)
     """
     try:
-        pr = next((p for p in profiles_active(user_rec) if p.get("name") == pname and p.get("type") == "xray"), None)
+        pr = next(
+            (
+                p
+                for p in profiles_active(user_rec)
+                if p.get("name") == pname and p.get("type") == "xray"
+            ),
+            None,
+        )
         if not pr:
             return ("absent", "Отсутствует ⚠️")
         if pr.get("suspended"):
@@ -593,10 +706,10 @@ def _qr_png_bytes(text: str) -> bytes:
     return bio.getvalue()
 
 
-
 # ===== ЧТЕНИЕ ЛОГОВ =====
 
 LOG_FILE_PATH = Path("/app/data/logs/bot.log")
+
 
 def _tail_lines(path: Path, n: int = 50) -> list[str]:
     """Эффективно читает последние n строк текстового файла."""
@@ -618,15 +731,16 @@ def _tail_lines(path: Path, n: int = 50) -> list[str]:
     except Exception:
         return []
 
+
 def _format_log_line(js: dict) -> str:
     """Делаем короткую человеческую строку из JSON-строки лога."""
-    ts   = js.get("ts", "-")
-    ev   = js.get("event", js.get("msg", "-"))
-    lvl  = js.get("level", "-")
-    rid  = js.get("rid", "-")
-    uid  = js.get("uid", "-")
-    cmd  = js.get("cmd", "-")
-    et   = js.get("error_type", "")
+    ts = js.get("ts", "-")
+    ev = js.get("event", js.get("msg", "-"))
+    lvl = js.get("level", "-")
+    rid = js.get("rid", "-")
+    uid = js.get("uid", "-")
+    cmd = js.get("cmd", "-")
+    et = js.get("error_type", "")
     if et:
         ev = f"{ev} ({et})"
     # Пример: 2025-11-03T05:55:10Z ERROR handler_error rid=abcd1234 uid=123 /status (RuntimeError)
@@ -640,26 +754,36 @@ def run_cmd(cmd: str, timeout: int = 6):
     Не бросает исключения, чтобы не валить хэндлеры.
     """
     try:
-        p = subprocess.run(cmd, shell=True,
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           text=True, timeout=timeout)
+        p = subprocess.run(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
         return p.returncode, p.stdout.strip(), p.stderr.strip()
     except Exception as e:
         return 999, "", str(e)
 
+
 def human_seconds(s: float) -> str:
     s = int(s)
-    if s < 60: return f"{s}s"
+    if s < 60:
+        return f"{s}s"
     m, s = divmod(s, 60)
-    if m < 60: return f"{m}m{'' if s==0 else f' {s}s'}"
+    if m < 60:
+        return f"{m}m{'' if s==0 else f' {s}s'}"
     h, m = divmod(m, 60)
     return f"{h}h{'' if m==0 else f' {m}m'}"
+
 
 def dir_size_bytes(path: str) -> int:
     try:
         total = 0
         p = Path(path)
-        if not p.exists(): return 0
+        if not p.exists():
+            return 0
         for x in p.rglob("*"):
             if x.is_file():
                 total += x.stat().st_size
@@ -691,6 +815,7 @@ def docker_stats() -> dict:
         }
     return stats
 
+
 def humanize_uptime(status_text: str) -> str:
     """
     Превращает хвост после 'Up ...' в короткий RU-вид.
@@ -702,41 +827,40 @@ def humanize_uptime(status_text: str) -> str:
     Если не удалось — возвращает исходную строку.
     """
     st = (status_text or "").strip()
-    m = re.search(r'\bUp\s+(.+)', st, flags=re.I)
+    m = re.search(r"\bUp\s+(.+)", st, flags=re.I)
     if not m:
         return st
 
     tail = m.group(1)
 
     # Удалить "about", "health: starting", "(healthy)" и т.п.
-    tail = re.sub(r'\babout\b', '', tail, flags=re.I)
-    tail = re.sub(r'\(healthy\)|\(unhealthy\)|\(.*?health.*?\)', '', tail, flags=re.I)
-    tail = tail.replace('healthy', '').replace('unhealthy', '')
+    tail = re.sub(r"\babout\b", "", tail, flags=re.I)
+    tail = re.sub(r"\(healthy\)|\(unhealthy\)|\(.*?health.*?\)", "", tail, flags=re.I)
+    tail = tail.replace("healthy", "").replace("unhealthy", "")
 
     # 'less than a second' / 'less than 1 second'
-    tail = re.sub(r'less\s+than\s+a\s+second', 'less than 1 second', tail, flags=re.I)
-    tail = re.sub(r'less\s+than\s+1\s*second', '<1 second', tail, flags=re.I)
+    tail = re.sub(r"less\s+than\s+a\s+second", "less than 1 second", tail, flags=re.I)
+    tail = re.sub(r"less\s+than\s+1\s*second", "<1 second", tail, flags=re.I)
 
     # Превратить a/an -> 1 (чтобы 'an hour' => '1 hour', 'a minute' => '1 minute')
-    tail = re.sub(r'\b(an|a)\b', '1', tail, flags=re.I)
+    tail = re.sub(r"\b(an|a)\b", "1", tail, flags=re.I)
 
     # Замена единиц на RU-сокращения
     repl = [
-        (r'\bweeks?\b', 'нед'),
-        (r'\bdays?\b', 'дн'),
-        (r'\bhours?\b', 'ч'),
-        (r'\bminutes?\b', 'мин'),
-        (r'\bseconds?\b', 'с'),
-        (r'<1\s*second', '<1 с'),
+        (r"\bweeks?\b", "нед"),
+        (r"\bdays?\b", "дн"),
+        (r"\bhours?\b", "ч"),
+        (r"\bminutes?\b", "мин"),
+        (r"\bseconds?\b", "с"),
+        (r"<1\s*second", "<1 с"),
     ]
     for pat, ru in repl:
         tail = re.sub(pat, ru, tail, flags=re.I)
 
     # Чистим лишние пробелы и шум
-    tail = re.sub(r'\s+', ' ', tail).strip().strip(',').strip()
+    tail = re.sub(r"\s+", " ", tail).strip().strip(",").strip()
 
     return f"работает {tail}"
-
 
 
 def prettify_container_status(name: str, status_text: str) -> str:
@@ -760,6 +884,7 @@ def prettify_container_status(name: str, status_text: str) -> str:
     rus = rus.replace("Restarting", "перезапуск").replace("Exited", "остановлен")
     return f"{emoji} {name} — {rus or 'не запущен'}"
 
+
 def summarize_counters(ok: int, warn: int, bad: int) -> str:
     """
     Возвращает одну строку-резюме по количеству зелёных/жёлтых/красных пунктов.
@@ -776,6 +901,7 @@ def tcp_check(host: str, port: int, timeout_ms: int = 800) -> bool:
     """Быстрая проверка TCP-порта (без TLS)."""
     try:
         import socket
+
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout_ms / 1000.0)
         sock.connect((host, int(port)))
@@ -783,6 +909,7 @@ def tcp_check(host: str, port: int, timeout_ms: int = 800) -> bool:
         return True
     except Exception:
         return False
+
 
 # ======= ПРОБА СТАТУСА (СБОР ДАННЫХ) + РЕНДЕР =======
 def status_probe() -> dict:
@@ -796,9 +923,11 @@ def status_probe() -> dict:
     # docker-proxy
     rc_ver, out_ver, err_ver = run_cmd("docker version --format '{{.Server.Version}}'")
     if rc_ver == 0 and out_ver:
-        probe["proxy_line"] = f"🟢 docker-proxy — OK (демон {out_ver})"; ok += 1
+        probe["proxy_line"] = f"🟢 docker-proxy — OK (демон {out_ver})"
+        ok += 1
     else:
-        probe["proxy_line"] = f"🔴 docker-proxy — ошибка ({err_ver or rc_ver})"; bad += 1
+        probe["proxy_line"] = f"🔴 docker-proxy — ошибка ({err_ver or rc_ver})"
+        bad += 1
 
     # docker ps
     rc_ps, out_ps, _ = run_cmd("docker ps --format '{{.Names}}\\t{{.Status}}'")
@@ -822,11 +951,18 @@ def status_probe() -> dict:
         st = statuses.get(name, "не запущен")
         low = st.lower()
         if ("unhealthy" in low) or ("restarting" in low):
-            cont_lines.append(f"🟡 {name} — {humanize_uptime(st) if 'up' in low else st}"); warn += 1
+            cont_lines.append(
+                f"🟡 {name} — {humanize_uptime(st) if 'up' in low else st}"
+            )
+            warn += 1
         elif ("up" in low) or ("healthy" in low):
-            cont_lines.append(f"🟢 {name} — {humanize_uptime(st) if 'up' in low else st}"); ok += 1
+            cont_lines.append(
+                f"🟢 {name} — {humanize_uptime(st) if 'up' in low else st}"
+            )
+            ok += 1
         else:
-            cont_lines.append(f"🔴 {name} — {st or 'не запущен'}"); bad += 1
+            cont_lines.append(f"🔴 {name} — {st or 'не запущен'}")
+            bad += 1
     probe["containers"] = cont_lines
 
     # конфиги доступности
@@ -834,17 +970,21 @@ def status_probe() -> dict:
     xray_cfg = os.getenv("XRAY_CONFIG_PATH", "/opt/amnezia/xray/server.json")
     rc_x, _, _ = _docker_exec(xray_c, f"test -r {shlex.quote(xray_cfg)}")
     if rc_x == 0:
-        probe["xray_line"] = f"🟢 XRay конфиг доступен в {xray_c}"; ok += 1
+        probe["xray_line"] = f"🟢 XRay конфиг доступен в {xray_c}"
+        ok += 1
     else:
-        probe["xray_line"] = f"🔴 XRay конфиг недоступен в {xray_c}"; bad += 1
+        probe["xray_line"] = f"🔴 XRay конфиг недоступен в {xray_c}"
+        bad += 1
 
     awg_c = os.getenv("AWG_CONTAINER", "amnezia-awg")
     awg_cfg = os.getenv("AWG_CONFIG_PATH", "/opt/amnezia/awg/wg0.conf")
     rc_a, _, _ = _docker_exec(awg_c, f"test -r {shlex.quote(awg_cfg)}")
     if rc_a == 0:
-        probe["awg_line"] = f"🟢 AmneziaWG конфиг доступен в {awg_c}"; ok += 1
+        probe["awg_line"] = f"🟢 AmneziaWG конфиг доступен в {awg_c}"
+        ok += 1
     else:
-        probe["awg_line"] = f"🔴 AmneziaWG конфиг недоступен в {awg_c}"; bad += 1
+        probe["awg_line"] = f"🔴 AmneziaWG конфиг недоступен в {awg_c}"
+        bad += 1
 
     # storage
     can_write = True
@@ -858,19 +998,24 @@ def status_probe() -> dict:
 
     size_mb = dir_size_bytes(DATA_DIR) / (1024 * 1024)
     if can_write:
-        probe["storage_line"] = f"🟢 /app/data — запись: да, объём: {size_mb:.1f} МБ"; ok += 1
+        probe["storage_line"] = f"🟢 /app/data — запись: да, объём: {size_mb:.1f} МБ"
+        ok += 1
     else:
-        probe["storage_line"] = f"🔴 /app/data — запись: нет, объём: {size_mb:.1f} МБ"; bad += 1
+        probe["storage_line"] = f"🔴 /app/data — запись: нет, объём: {size_mb:.1f} МБ"
+        bad += 1
 
     # heartbeat
     try:
         hb_age = time.time() - os.path.getmtime(HEARTBEAT_PATH)
         if hb_age < 120:
-            probe["hb_line"] = f"🟢 heartbeat: {human_seconds(hb_age)} назад"; ok += 1
+            probe["hb_line"] = f"🟢 heartbeat: {human_seconds(hb_age)} назад"
+            ok += 1
         else:
-            probe["hb_line"] = f"🟡 heartbeat: {human_seconds(hb_age)} назад"; warn += 1
+            probe["hb_line"] = f"🟡 heartbeat: {human_seconds(hb_age)} назад"
+            warn += 1
     except Exception:
-        probe["hb_line"] = "🔴 heartbeat: недоступен"; bad += 1
+        probe["hb_line"] = "🔴 heartbeat: недоступен"
+        bad += 1
 
     # аптайм бота
     probe["uptime_bot"] = human_seconds(time.time() - _BOOT_TS)
@@ -883,6 +1028,7 @@ def status_probe() -> dict:
     probe["bad"] = bad
     probe["important"] = important
     return probe
+
 
 def sync_collect():
     """
@@ -910,11 +1056,11 @@ def sync_collect():
     # Быстрые lookup-индексы по "своим"
     xray_by_key = {(c.get("tid"), c.get("name")): c for c in xray_bot}
 
-    only_in_state = []   # профили, которых нет среди "своих" в Xray
-    only_in_xray = []    # "свои" клиенты, которых нет в state (редко, но возможно)
-    diverged = []        # на будущее — отличия uuid/flow и т.п.
-    suspended = []       # считаем по state
-    active = []          # считаем по state
+    only_in_state = []  # профили, которых нет среди "своих" в Xray
+    only_in_xray = []  # "свои" клиенты, которых нет в state (редко, но возможно)
+    diverged = []  # на будущее — отличия uuid/flow и т.п.
+    suspended = []  # считаем по state
+    active = []  # считаем по state
 
     # Проходимся по state
     users = st.get("users", {})
@@ -963,9 +1109,12 @@ def sync_collect():
         "diverged": len(diverged),
         "suspended": len(suspended),
         "active": len(active),
-        "foreign": len(xray_foreign),   # <-- новая метрика
+        "foreign": len(xray_foreign),  # <-- новая метрика
         "profiles_state": sum(
-            1 for u in users.values() for p in profiles_active(u) if p.get("type") == "xray"
+            1
+            for u in users.values()
+            for p in profiles_active(u)
+            if p.get("type") == "xray"
         ),
         "clients_xray": len(xray_bot),  # считаем ТОЛЬКО "своих"
         "users": len(users),
@@ -978,9 +1127,264 @@ def sync_collect():
         "diverged": diverged,
         "suspended": suspended,
         "active": active,
-        "foreign": xray_foreign,   # отдаём список чужих, чтобы красиво отрисовать в detailed
+        "foreign": xray_foreign,  # отдаём список чужих, чтобы красиво отрисовать в detailed
     }
 
+
+# ========= СЕРВИСНЫЕ ДЕЙСТВИЯ ДЛЯ /sync (backend-уровень) =========
+# Работают ТОЛЬКО с профилями, которые бот считает "своими".
+# "Чужие" (foreign) не затрагиваются.
+
+
+def _get_state_profile(
+    st: dict, tid: int, name: str
+) -> tuple[dict | None, dict | None]:
+    """Возвращает (urec, profile) из state.json для пользователя tid и профиля name (type=xray, не удалённый)."""
+    urec = st.get("users", {}).get(str(tid))
+    if not isinstance(urec, dict):
+        return None, None
+    for p in profiles_active(urec):
+        if p.get("type") == "xray" and p.get("name") == name:
+            return urec, p
+    return urec, None
+
+
+def _log_apply(event: str, **kw):
+    try:
+        logger.info({"event": event, **kw})
+    except Exception:
+        pass
+
+
+def sync_absent_apply_one(tid: int, name: str) -> tuple[bool, str]:
+    """
+    Починить кейс ONLY_IN_STATE для одного профиля: добавить профиль в Xray.
+    Возвращает (ok, reason). Возможные reason:
+      ok: "ok"
+      fail:
+        - "user_not_in_state"
+        - "profile_not_in_state"
+        - "profile_suspended"
+        - "already_present"
+        - "xray_add_fail"
+    """
+    st = load_state()
+    urec, pr = _get_state_profile(st, tid, name)
+    if not urec:
+        _log_apply(
+            "sync_absent_apply_one",
+            tid=tid,
+            name=name,
+            ok=False,
+            reason="user_not_in_state",
+        )
+        return False, "user_not_in_state"
+    if not pr:
+        _log_apply(
+            "sync_absent_apply_one",
+            tid=tid,
+            name=name,
+            ok=False,
+            reason="profile_not_in_state",
+        )
+        return False, "profile_not_in_state"
+    if pr.get("suspended"):
+        _log_apply(
+            "sync_absent_apply_one",
+            tid=tid,
+            name=name,
+            ok=False,
+            reason="profile_suspended",
+        )
+        return False, "profile_suspended"
+
+    # если вдруг уже появился в Xray — ничего не делаем
+    try:
+        if XR.find_user(tid, name):
+            _log_apply(
+                "sync_absent_apply_one",
+                tid=tid,
+                name=name,
+                ok=False,
+                reason="already_present",
+            )
+            return False, "already_present"
+    except Exception:
+        # игнорируем — пробуем добавить
+        pass
+
+    # добавляем в Xray (ботом), обновляем uuid в state (если вернулся)
+    try:
+        res = XR.add_user(
+            tid, name
+        )  # вернёт {"uuid","email","uri","client_json","last_config_str","port","sni"}
+        if isinstance(res, dict) and res.get("uuid"):
+            pr["uuid"] = res["uuid"]
+        pr["last_xray_sync_at"] = now_iso()
+        save_state(st)
+        _log_apply(
+            "sync_absent_apply_one",
+            tid=tid,
+            name=name,
+            ok=True,
+            reason="ok",
+            uuid=pr.get("uuid"),
+        )
+        return True, "ok"
+    except Exception as e:
+        _log_apply(
+            "sync_absent_apply_one",
+            tid=tid,
+            name=name,
+            ok=False,
+            reason="xray_add_fail",
+            error=str(e),
+        )
+        return False, "xray_add_fail"
+
+
+def sync_extra_apply_one(tid: int, name: str) -> tuple[bool, str]:
+    """
+    Починить кейс ONLY_IN_XRAY (свои): удалить "лишнего" клиента из Xray.
+    Работает ТОЛЬКО для клиентов, созданных ботом (source=bot).
+    Возвращает (ok, reason). Возможные reason:
+      ok: "ok"
+      fail:
+        - "not_found_in_xray" (или это foreign)
+        - "xray_remove_fail"
+    """
+    # найдём в живом списке "своих" клиентов
+    try:
+        xlist = XR.list_all() or []
+    except Exception:
+        xlist = []
+
+    target = None
+    for c in xlist:
+        if c.get("source") != "bot":
+            continue
+        if int(c.get("tid") or 0) == int(tid) and (c.get("name") or "") == name:
+            target = c
+            break
+
+    if not target:
+        _log_apply(
+            "sync_extra_apply_one",
+            tid=tid,
+            name=name,
+            ok=False,
+            reason="not_found_in_xray",
+        )
+        return False, "not_found_in_xray"
+
+    # удаляем из Xray
+    try:
+        ok = XR.remove_user_by_name(tid, name)
+        if not ok:
+            _log_apply(
+                "sync_extra_apply_one",
+                tid=tid,
+                name=name,
+                ok=False,
+                reason="xray_remove_fail",
+            )
+            return False, "xray_remove_fail"
+        _log_apply(
+            "sync_extra_apply_one",
+            tid=tid,
+            name=name,
+            ok=True,
+            reason="ok",
+            uuid=target.get("uuid"),
+        )
+        return True, "ok"
+    except Exception as e:
+        _log_apply(
+            "sync_extra_apply_one",
+            tid=tid,
+            name=name,
+            ok=False,
+            reason="xray_remove_fail",
+            error=str(e),
+        )
+        return False, "xray_remove_fail"
+
+
+def sync_absent_apply_all() -> dict:
+    """
+    Массово починить все ONLY_IN_STATE (только профили не suspended).
+    НИКОГО не трогаем из foreign.
+    Возвращает сводку: {"total":N, "done":N, "skipped":N, "errors":N, "items":[...]}
+    """
+    snap = sync_collect()
+    items = snap.get("only_in_state", [])  # [{"tid":..,"name":..}, ...]
+    total = len(items)
+    done = skipped = errors = 0
+    results = []
+
+    for it in items:
+        tid = int(it.get("tid") or 0)
+        name = it.get("name") or ""
+        ok, reason = sync_absent_apply_one(tid, name)
+        results.append({"tid": tid, "name": name, "ok": ok, "reason": reason})
+        if ok:
+            done += 1
+        else:
+            # считаем «already_present» как skip, прочее — как errors
+            if reason in (
+                "user_not_in_state",
+                "profile_not_in_state",
+                "profile_suspended",
+                "already_present",
+            ):
+                skipped += 1
+            else:
+                errors += 1
+
+    summary = {
+        "total": total,
+        "done": done,
+        "skipped": skipped,
+        "errors": errors,
+        "items": results,
+    }
+    _log_apply("sync_absent_apply_all", **summary)
+    return summary
+
+
+def sync_extra_apply_all() -> dict:
+    """
+    Массово починить все ONLY_IN_XRAY (только source=bot), т.е. удалить лишних из Xray.
+    Возвращает сводку: {"total":N, "done":N, "skipped":N, "errors":N, "items":[...]}
+    """
+    snap = sync_collect()
+    items = snap.get("only_in_xray", [])  # [{"tid":..,"name":..,"uuid":..}, ...]
+    total = len(items)
+    done = skipped = errors = 0
+    results = []
+
+    for it in items:
+        tid = int(it.get("tid") or 0)
+        name = it.get("name") or ""
+        ok, reason = sync_extra_apply_one(tid, name)
+        results.append({"tid": tid, "name": name, "ok": ok, "reason": reason})
+        if ok:
+            done += 1
+        else:
+            if reason == "not_found_in_xray":
+                skipped += 1
+            else:
+                errors += 1
+
+    summary = {
+        "total": total,
+        "done": done,
+        "skipped": skipped,
+        "errors": errors,
+        "items": results,
+    }
+    _log_apply("sync_extra_apply_all", **summary)
+    return summary
 
 
 async def _sync_report_send_or_edit(update, context, flt: str, mode: str):
@@ -990,19 +1394,22 @@ async def _sync_report_send_or_edit(update, context, flt: str, mode: str):
     """
     data = sync_collect()
     # лог
-    logger.info({
-        "event": "sync_report",
-        "filter": flt,
-        "mode": mode,
-        **data.get("counters", {})
-    })
+    logger.info(
+        {
+            "event": "sync_report",
+            "filter": flt,
+            "mode": mode,
+            **data.get("counters", {}),
+        }
+    )
 
     parts = sync_render(data, flt, mode)
     kb = build_sync_kb(flt, mode)
 
     # 1-я часть — через наш _edit_cb_with_fallback (он сам решит редактировать или слать новое + удалить старое)
     m = await _edit_cb_with_fallback(
-        update, context,
+        update,
+        context,
         parts[0],
         kb=kb,
         parse_mode="HTML",
@@ -1053,12 +1460,12 @@ def render_status_full(probe: dict) -> list[str]:
     ]
 
     # строки из probe
-    summary       = probe.get("summary", "—")
-    proxy_line    = probe.get("proxy_line", "docker-proxy: —")
-    xray_line     = probe.get("xray_line",  "XRay конфиг: —")
-    awg_line      = probe.get("awg_line",   "AmneziaWG конфиг: —")
-    storage_line  = probe.get("storage_line", "/app/data: —")
-    hb_line       = probe.get("hb_line", "heartbeat: —")
+    summary = probe.get("summary", "—")
+    proxy_line = probe.get("proxy_line", "docker-proxy: —")
+    xray_line = probe.get("xray_line", "XRay конфиг: —")
+    awg_line = probe.get("awg_line", "AmneziaWG конфиг: —")
+    storage_line = probe.get("storage_line", "/app/data: —")
+    hb_line = probe.get("hb_line", "heartbeat: —")
 
     # Контейнеры — обычным списком
     cont_block: list[str] = []
@@ -1067,13 +1474,13 @@ def render_status_full(probe: dict) -> list[str]:
         low = st.lower()
         if ("unhealthy" in low) or ("restarting" in low):
             badge = "🟡"
-            nice  = humanize_uptime(st) if "up" in low else (st or "не запущен")
+            nice = humanize_uptime(st) if "up" in low else (st or "не запущен")
         elif ("up" in low) or ("healthy" in low):
             badge = "🟢"
-            nice  = humanize_uptime(st) if "up" in low else (st or "не запущен")
+            nice = humanize_uptime(st) if "up" in low else (st or "не запущен")
         else:
             badge = "🔴"
-            nice  = st or "не запущен"
+            nice = st or "не запущен"
         cont_block.append(f"{badge} {name} — {nice}")
 
     lines: list[str] = [
@@ -1100,9 +1507,13 @@ def render_status_full(probe: dict) -> list[str]:
         for name in important:
             s = stats.get(name)
             if s:
-                lines.append(f"• {name}: CPU {s['cpu']}, Память {s['mem']} ({s['memp']})")
+                lines.append(
+                    f"• {name}: CPU {s['cpu']}, Память {s['mem']} ({s['memp']})"
+                )
 
-    rc_df, out_df, _ = run_cmd("df -h /app/data | tail -n 1 | awk '{print $2\" всего, \" $4\" свободно (\"$5\" занято)\"}'")
+    rc_df, out_df, _ = run_cmd(
+        'df -h /app/data | tail -n 1 | awk \'{print $2" всего, " $4" свободно ("$5" занято)"}\''
+    )
     if rc_df == 0 and out_df:
         lines.append(f"💽 /app/data: {out_df}")
 
@@ -1122,30 +1533,42 @@ def _sync_header(c: dict) -> str:
         f"Активные: <b>{c['active']}</b>"
     )
 
+
 def _sync_filter_items(data: dict, flt: str) -> list[dict]:
     if flt == "all":
         # хотим порядок: absent, extra, suspended, diverged, active
         tagged = (
-            [dict(x, _tag="absent")    for x in data["only_in_state"]] +
-            [dict(x, _tag="extra")     for x in data["only_in_xray"]] +
-            [dict(x, _tag="suspended") for x in data["suspended"]] +
-            [dict(x, _tag="diverged")  for x in data["diverged"]] +
-            [dict(x, _tag="active")    for x in data["active"]]
+            [dict(x, _tag="absent") for x in data["only_in_state"]]
+            + [dict(x, _tag="extra") for x in data["only_in_xray"]]
+            + [dict(x, _tag="suspended") for x in data["suspended"]]
+            + [dict(x, _tag="diverged") for x in data["diverged"]]
+            + [dict(x, _tag="active") for x in data["active"]]
         )
         return tagged
-    if flt == "absent":     return [dict(x, _tag="absent")    for x in data["only_in_state"]]
-    if flt == "extra":      return [dict(x, _tag="extra")     for x in data["only_in_xray"]]
-    if flt == "suspended":  return [dict(x, _tag="suspended") for x in data["suspended"]]
-    if flt == "diverged":   return [dict(x, _tag="diverged")  for x in data["diverged"]]
+    if flt == "absent":
+        return [dict(x, _tag="absent") for x in data["only_in_state"]]
+    if flt == "extra":
+        return [dict(x, _tag="extra") for x in data["only_in_xray"]]
+    if flt == "suspended":
+        return [dict(x, _tag="suspended") for x in data["suspended"]]
+    if flt == "diverged":
+        return [dict(x, _tag="diverged") for x in data["diverged"]]
     return []
 
+
 def _sync_status_label(tag: str, diffs: list[str] | None = None) -> str:
-    if tag == "active":     return "Активен ▶️"
-    if tag == "suspended":  return "Приостановлен ⏸"
-    if tag == "absent":     return "Отсутствует в Xray ⚠️"
-    if tag == "extra":      return "Лишний в Xray 🧩"
-    if tag == "diverged":   return "Расхождение ❗" + (f" ({', '.join(diffs)})" if diffs else "")
+    if tag == "active":
+        return "Активен ▶️"
+    if tag == "suspended":
+        return "Приостановлен ⏸"
+    if tag == "absent":
+        return "Отсутствует в Xray ⚠️"
+    if tag == "extra":
+        return "Лишний в Xray 🧩"
+    if tag == "diverged":
+        return "Расхождение ❗" + (f" ({', '.join(diffs)})" if diffs else "")
     return tag
+
 
 def sync_render(data: dict, flt: str, mode: str) -> list[str]:
     """
@@ -1156,11 +1579,11 @@ def sync_render(data: dict, flt: str, mode: str) -> list[str]:
     """
     c = data.get("counters", {})
     only_in_state = data.get("only_in_state", [])
-    only_in_xray  = data.get("only_in_xray", [])
-    diverged      = data.get("diverged", [])
-    suspended     = data.get("suspended", [])
-    active        = data.get("active", [])
-    foreign       = data.get("foreign", [])
+    only_in_xray = data.get("only_in_xray", [])
+    diverged = data.get("diverged", [])
+    suspended = data.get("suspended", [])
+    active = data.get("active", [])
+    foreign = data.get("foreign", [])
 
     hdr = (
         "<b>Синхронизация Xray ↔ БД</b>\n"
@@ -1173,16 +1596,23 @@ def sync_render(data: dict, flt: str, mode: str) -> list[str]:
     lines = [hdr]
 
     def fmt_pairs(items):
-        return "\n".join(
-            f"• <code>{i.get('tid',0)}</code> · <b>{i.get('name','')}</b>"
-            for i in items
-        ) or "—"
+        return (
+            "\n".join(
+                f"• <code>{i.get('tid',0)}</code> · <b>{i.get('name','')}</b>"
+                for i in items
+            )
+            or "—"
+        )
 
     # Фильтр
     if flt == "all":
         body = []
-        body.append(f"<b>Отсутствуют в Xray (есть в БД):</b>\n{fmt_pairs(only_in_state)}")
-        body.append(f"<b>Есть в Xray (свои), отсутствуют в БД:</b>\n{fmt_pairs(only_in_xray)}")
+        body.append(
+            f"<b>Отсутствуют в Xray (есть в БД):</b>\n{fmt_pairs(only_in_state)}"
+        )
+        body.append(
+            f"<b>Есть в Xray (свои), отсутствуют в БД:</b>\n{fmt_pairs(only_in_xray)}"
+        )
         if diverged:
             body.append(f"<b>Расхождения:</b>\n{fmt_pairs(diverged)}")
         if suspended:
@@ -1197,19 +1627,28 @@ def sync_render(data: dict, flt: str, mode: str) -> list[str]:
                 for f in foreign
             )
             body.append(
-                "<b>Чужие клиенты Xray (не управляются ботом, действий не будет):</b>\n" + fx
+                "<b>Чужие клиенты Xray (не управляются ботом, действий не будет):</b>\n"
+                + fx
             )
 
         lines.append("\n\n".join(body))
 
     elif flt == "absent":
-        lines.append("<b>Отсутствуют в Xray (есть в БД):</b>\n" + fmt_pairs(only_in_state))
+        lines.append(
+            "<b>Отсутствуют в Xray (есть в БД):</b>\n" + fmt_pairs(only_in_state)
+        )
     elif flt == "extra":
-        lines.append("<b>Есть в Xray (свои), отсутствуют в БД:</b>\n" + fmt_pairs(only_in_xray))
+        lines.append(
+            "<b>Есть в Xray (свои), отсутствуют в БД:</b>\n" + fmt_pairs(only_in_xray)
+        )
     elif flt == "diverged":
-        lines.append("<b>Расхождения:</b>\n" + (fmt_pairs(diverged) if diverged else "—"))
+        lines.append(
+            "<b>Расхождения:</b>\n" + (fmt_pairs(diverged) if diverged else "—")
+        )
     elif flt == "suspended":
-        lines.append("<b>Приостановлены:</b>\n" + (fmt_pairs(suspended) if suspended else "—"))
+        lines.append(
+            "<b>Приостановлены:</b>\n" + (fmt_pairs(suspended) if suspended else "—")
+        )
     elif flt == "active":
         lines.append("<b>Активны:</b>\n" + (fmt_pairs(active) if active else "—"))
     else:
@@ -1240,10 +1679,12 @@ def _split_text_for_telegram(s: str, limit: int = 3500) -> list[str]:
             parts.append("".join(buf))
             buf, total = [line], ln
         else:
-            buf.append(line); total += ln
+            buf.append(line)
+            total += ln
     if buf:
         parts.append("".join(buf))
     return parts or [SAFE_TXT]
+
 
 def _sync_collect_probe() -> dict:
     """
@@ -1303,15 +1744,17 @@ def _sync_collect_probe() -> dict:
                     label = "Отсутствует ⚠️"
                     t_absent += 1
 
-            rows.append({
-                "tid": tid,
-                "username": uname,
-                "name": pname,
-                "suspended": is_susp,
-                "present": present,
-                "status": status,
-                "label": label,
-            })
+            rows.append(
+                {
+                    "tid": tid,
+                    "username": uname,
+                    "name": pname,
+                    "suspended": is_susp,
+                    "present": present,
+                    "status": status,
+                    "label": label,
+                }
+            )
 
     probe = {
         "ts": now_iso(),
@@ -1327,7 +1770,9 @@ def _sync_collect_probe() -> dict:
     return probe
 
 
-def _sync_render_page(probe: dict, page: int = 0, page_size: int = 10) -> tuple[str, InlineKeyboardMarkup]:
+def _sync_render_page(
+    probe: dict, page: int = 0, page_size: int = 10
+) -> tuple[str, InlineKeyboardMarkup]:
     rows = probe.get("rows", [])
     totals = probe.get("totals", {})
     n = len(rows)
@@ -1365,17 +1810,24 @@ def _sync_render_page(probe: dict, page: int = 0, page_size: int = 10) -> tuple[
     # Кнопки: пагинация + обновить + назад
     nav_row = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"admin_sync_page:{page-1}"))
+        nav_row.append(
+            InlineKeyboardButton("⬅️", callback_data=f"admin_sync_page:{page-1}")
+        )
     if page < pages - 1:
-        nav_row.append(InlineKeyboardButton("➡️", callback_data=f"admin_sync_page:{page+1}"))
+        nav_row.append(
+            InlineKeyboardButton("➡️", callback_data=f"admin_sync_page:{page+1}")
+        )
 
     rows_kb = []
     if nav_row:
         rows_kb.append(nav_row)
-    rows_kb.append([InlineKeyboardButton("🔄 Обновить", callback_data="admin_sync_refresh")])
+    rows_kb.append(
+        [InlineKeyboardButton("🔄 Обновить", callback_data="admin_sync_refresh")]
+    )
     rows_kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_menu")])
 
     return text, InlineKeyboardMarkup(rows_kb)
+
 
 async def _sync_show(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
     # 1) собрать свежую пробу
@@ -1408,26 +1860,40 @@ def build_status_kb(_want_full: bool | None = None) -> InlineKeyboardMarkup:
         ]
     )
 
+
 def build_sync_kb(active_filter: str, mode: str) -> InlineKeyboardMarkup:
     def _radio(code: str) -> str:
         return ("• " if code == active_filter else "○ ") + SYNC_FILTERS[code]
 
     rows = [
         [
-            InlineKeyboardButton(_radio("all"),       callback_data="sync_filter:all"),
-            InlineKeyboardButton(_radio("absent"),    callback_data="sync_filter:absent"),
+            InlineKeyboardButton(_radio("all"), callback_data="sync_filter:all"),
+            InlineKeyboardButton(_radio("absent"), callback_data="sync_filter:absent"),
         ],
         [
-            InlineKeyboardButton(_radio("extra"),     callback_data="sync_filter:extra"),
-            InlineKeyboardButton(_radio("suspended"), callback_data="sync_filter:suspended"),
+            InlineKeyboardButton(_radio("extra"), callback_data="sync_filter:extra"),
+            InlineKeyboardButton(
+                _radio("suspended"), callback_data="sync_filter:suspended"
+            ),
         ],
         [
-            InlineKeyboardButton(_radio("diverged"),  callback_data="sync_filter:diverged"),
+            InlineKeyboardButton(
+                _radio("diverged"), callback_data="sync_filter:diverged"
+            ),
         ],
         [
             InlineKeyboardButton(
                 SYNC_MODE_LABEL["compact" if mode == "detailed" else "detailed"],
-                callback_data="sync_mode:" + ("compact" if mode == "detailed" else "detailed"),
+                callback_data="sync_mode:"
+                + ("compact" if mode == "detailed" else "detailed"),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🧩 Починить отсутствующие", callback_data="sync_apply_absent_all"
+            ),
+            InlineKeyboardButton(
+                "🧹 Убрать лишние", callback_data="sync_apply_extra_all"
             ),
         ],
         [
@@ -1440,7 +1906,6 @@ def build_sync_kb(active_filter: str, mode: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-    
 # Белый список контейнеров, в которые разрешаем docker exec
 ALLOWED_CONTAINERS = {
     os.getenv("AWG_CONTAINER", "amnezia-awg"),
@@ -1449,18 +1914,22 @@ ALLOWED_CONTAINERS = {
     "awgbot",
 }
 
+
 def _docker_exec(container: str, cmd: str, timeout: int = 6):
     if container not in ALLOWED_CONTAINERS:
         return 998, "", f"container {container} not allowed"
     safe = f"docker exec {shlex.quote(container)} sh -lc {shlex.quote(cmd)}"
     return run_cmd(safe, timeout=timeout)
 
+
 # ========= ОБОЛОЧКИ ДЛЯ КЛЮЧЕЙ AMNEZIA (vpn://) =========
 def b64url_nopad(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
 
 
-def build_amnezia_wrapper_json(name: str, host: str, port: str, last_cfg_str: str) -> str:
+def build_amnezia_wrapper_json(
+    name: str, host: str, port: str, last_cfg_str: str
+) -> str:
     wrapper = {
         "containers": [
             {
@@ -1557,7 +2026,9 @@ async def edit_or_send(
         if getattr(update, "callback_query", None) and update.callback_query:
             try:
                 return await update.callback_query.edit_message_reply_markup(
-                    reply_markup=ensure_main_menu_button(kb, add_menu_button=add_menu_button)
+                    reply_markup=ensure_main_menu_button(
+                        kb, add_menu_button=add_menu_button
+                    )
                 )
             except Exception:
                 pass
@@ -1571,7 +2042,9 @@ async def edit_or_send(
             if not _cb_message_is_last(update, context):
                 sent = await update.effective_chat.send_message(
                     text or SAFE_TXT,
-                    reply_markup=ensure_main_menu_button(kb, add_menu_button=add_menu_button),
+                    reply_markup=ensure_main_menu_button(
+                        kb, add_menu_button=add_menu_button
+                    ),
                     parse_mode=parse_mode,
                     disable_web_page_preview=True,
                 )
@@ -1592,7 +2065,9 @@ async def edit_or_send(
             try:
                 return await q.edit_message_text(
                     text or SAFE_TXT,
-                    reply_markup=ensure_main_menu_button(kb, add_menu_button=add_menu_button),
+                    reply_markup=ensure_main_menu_button(
+                        kb, add_menu_button=add_menu_button
+                    ),
                     parse_mode=parse_mode,
                     disable_web_page_preview=True,
                 )
@@ -1602,7 +2077,9 @@ async def edit_or_send(
                 if "message is not modified" in emsg:
                     return await q.edit_message_text(
                         _salt_text(text or SAFE_TXT),
-                        reply_markup=ensure_main_menu_button(kb, add_menu_button=add_menu_button),
+                        reply_markup=ensure_main_menu_button(
+                            kb, add_menu_button=add_menu_button
+                        ),
                         parse_mode=parse_mode,
                         disable_web_page_preview=True,
                     )
@@ -1618,7 +2095,9 @@ async def edit_or_send(
                 chat_id=chat_id,
                 message_id=last_msg_id,
                 text=text,
-                reply_markup=ensure_main_menu_button(kb, add_menu_button=add_menu_button),
+                reply_markup=ensure_main_menu_button(
+                    kb, add_menu_button=add_menu_button
+                ),
                 parse_mode=parse_mode,
                 disable_web_page_preview=True,
             )
@@ -1638,7 +2117,9 @@ async def edit_or_send(
 def main_menu_text(user: dict, is_admin: bool) -> str:
     first = user.get("first_name") or ""
     x_count = len([p for p in profiles_active(user) if p.get("type") == "xray"])
-    awg_count = len([p for p in profiles_active(user) if p.get("type") in ("amneziawg", "awg")])
+    awg_count = len(
+        [p for p in profiles_active(user) if p.get("type") in ("amneziawg", "awg")]
+    )
 
     badge = "👑 Администратор\n" if is_admin else ""
     greet = f"👋 Привет, {first}!\n" if first else "👋 Привет!\n"
@@ -1662,9 +2143,21 @@ def main_menu_kb(allowed: bool, is_admin: bool = False) -> InlineKeyboardMarkup:
     ]
 
     if is_admin:
-        rows.append([InlineKeyboardButton("📊 Статус инфраструктуры", callback_data="status_refresh")])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "📊 Статус инфраструктуры", callback_data="status_refresh"
+                )
+            ]
+        )
         rows.append([InlineKeyboardButton("🩺 Health", callback_data="status_health")])
-        rows.append([InlineKeyboardButton("🛠 Панель администратора", callback_data="admin_menu")])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🛠 Панель администратора", callback_data="admin_menu"
+                )
+            ]
+        )
 
     return InlineKeyboardMarkup(rows)
 
@@ -1697,9 +2190,23 @@ async def show_menu(
             "Вы также можете отправить заявку кнопкой ниже."
         )
         if prefer_edit:
-            await edit_or_send(update, context, txt, main_menu_kb(False), add_menu_button=False, parse_mode="HTML")
+            await edit_or_send(
+                update,
+                context,
+                txt,
+                main_menu_kb(False),
+                add_menu_button=False,
+                parse_mode="HTML",
+            )
         else:
-            await clean_and_send(update, context, txt, main_menu_kb(False), add_menu_button=False, parse_mode="HTML")
+            await clean_and_send(
+                update,
+                context,
+                txt,
+                main_menu_kb(False),
+                add_menu_button=False,
+                parse_mode="HTML",
+            )
         return
 
     txt = main_menu_text(user, is_admin)
@@ -1712,16 +2219,28 @@ async def show_menu(
 
 
 async def show_app_picker(update, context, pname: str, for_edit: bool = True):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌐 Другие клиенты (VLESS)", callback_data=f"prof_app_generic:{pname}")],
-        [InlineKeyboardButton("🛡 AmneziaVPN", callback_data=f"prof_app_amnezia:{pname}")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data=f"prof_open:{pname}:xray")],
-    ])
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🌐 Другие клиенты (VLESS)",
+                    callback_data=f"prof_app_generic:{pname}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🛡 AmneziaVPN", callback_data=f"prof_app_amnezia:{pname}"
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"prof_open:{pname}:xray")],
+        ]
+    )
     txt = f"Выберите приложение для <b>{pname}</b> · Xray"
     if for_edit:
         await edit_or_send(update, context, txt, kb, parse_mode="HTML")
     else:
         await clean_and_send(update, context, txt, kb, parse_mode="HTML")
+
 
 @autoclean_command_input
 @with_request_id
@@ -1729,16 +2248,18 @@ async def show_app_picker(update, context, pname: str, for_edit: bool = True):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_menu(update, context, welcome=True)
 
+
 @autoclean_command_input
 @with_request_id
 @log_command
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_menu(update, context, welcome=False)
 
+
 @autoclean_command_input
 async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    is_admin = (u.id in ADMIN_IDS)
+    is_admin = u.id in ADMIN_IDS
     lines = [
         f"👤 <b>{u.full_name}</b> @{u.username or '-'}",
         f"🆔 <code>{u.id}</code>",
@@ -1746,6 +2267,7 @@ async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📦 Лимиты: MAX_PROFILES={os.getenv('MAX_PROFILES','-')}, MAX_XRAY={os.getenv('MAX_XRAY','-')}, MAX_AWG={os.getenv('MAX_AWG','-')}",
     ]
     await update.effective_message.reply_html("\n".join(lines))
+
 
 @autoclean_command_input
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1760,6 +2282,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — главное меню\n"
         "/admin — панель администратора",
     )
+
 
 @with_request_id
 @log_command
@@ -1818,8 +2341,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         # перерисовка через cmd_status — он сам заменит это же сообщение на полный статус
-        context.chat_data["_allow_nested_from_cb"] = True   # разрешить вложенный вызов
-        context.chat_data["_suppress_log_once"] = True      # не дублировать логи
+        context.chat_data["_allow_nested_from_cb"] = True  # разрешить вложенный вызов
+        context.chat_data["_suppress_log_once"] = True  # не дублировать логи
         await cmd_status(update, context)
         return
 
@@ -1843,18 +2366,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "req_access":
         if is_admin_id(u.id):
-            await edit_or_send(update, context, "У вас уже есть полный доступ как у администратора.")
+            await edit_or_send(
+                update, context, "У вас уже есть полный доступ как у администратора."
+            )
             return
         txt = f"Заявка на доступ:\nID: `{u.id}`  username: `@{u.username}`"
         kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("✅ Одобрить", callback_data=f"admin_approve:{u.id}")]]
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Одобрить", callback_data=f"admin_approve:{u.id}"
+                    )
+                ]
+            ]
         )
         for aid in ADMIN_IDS:
             try:
                 await context.bot.send_message(chat_id=aid, text=txt, reply_markup=kb)
             except Exception:
                 pass
-        await edit_or_send(update, context, "Заявка отправлена администратору. Ожидайте одобрения.")
+        await edit_or_send(
+            update, context, "Заявка отправлена администратору. Ожидайте одобрения."
+        )
         return
 
     if not (user.get("allowed", False) or is_admin_id(u.id)):
@@ -1863,13 +2396,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if rec2.get("allowed", False):
             await show_menu(update, context, welcome=False, prefer_edit=True)
             return
-        await edit_or_send(update, context, "⛔ Доступ пока не выдан. Обратитесь к администратору.")
+        await edit_or_send(
+            update, context, "⛔ Доступ пока не выдан. Обратитесь к администратору."
+        )
         return
 
     if data == "create":
         kb = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("Xray (Reality/VLESS)", callback_data="create_type:xray")],
+                [
+                    InlineKeyboardButton(
+                        "Xray (Reality/VLESS)", callback_data="create_type:xray"
+                    )
+                ],
                 [InlineKeyboardButton("AmneziaWG", callback_data="create_type:awg")],
                 [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
             ]
@@ -1879,13 +2418,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("create_type:"):
         typ = data.split(":", 1)[1]
-        context.user_data["create_typ"] = ("amneziawg" if typ in ("awg", "amneziawg") else typ)
+        context.user_data["create_typ"] = (
+            "amneziawg" if typ in ("awg", "amneziawg") else typ
+        )
         context.user_data["awaiting_name"] = True
         await edit_or_send(
             update,
             context,
             "Введите имя конфигурации (латиница/цифры/._-):",
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="create")]]),
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="create")]]
+            ),
         )
         return
 
@@ -1894,16 +2437,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not active:
             empty_kb = InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("➕ Создать конфигурацию", callback_data="create")],
+                    [
+                        InlineKeyboardButton(
+                            "➕ Создать конфигурацию", callback_data="create"
+                        )
+                    ],
                     [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
                 ]
             )
-            await edit_or_send(update, context, "У вас пока нет конфигураций.", empty_kb)
+            await edit_or_send(
+                update, context, "У вас пока нет конфигураций.", empty_kb
+            )
             return
         rows = []
         for p in active:
-            label = p['name']
-            t = p['type']
+            label = p["name"]
+            t = p["type"]
             # добавим значок статуса только для xray
             if t == "xray":
                 status, _ = xray_profile_status_for_user(user, u.id, p["name"])
@@ -1916,17 +2465,36 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 # для awg пока без статусов
                 label = f"{label} · {t}"
-            rows.append([InlineKeyboardButton(label, callback_data=f"prof_open:{p['name']}:{t}")])
-        await edit_or_send(update, context, "Ваши конфигурации:", InlineKeyboardMarkup(rows))
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        label, callback_data=f"prof_open:{p['name']}:{t}"
+                    )
+                ]
+            )
+        await edit_or_send(
+            update, context, "Ваши конфигурации:", InlineKeyboardMarkup(rows)
+        )
         return
 
     if data.startswith("prof_open:"):
         _, pname, ptype = data.split(":", 2)
-        pr = next((p for p in profiles_active(user) if p["name"] == pname and p["type"] == ptype), None)
+        pr = next(
+            (
+                p
+                for p in profiles_active(user)
+                if p["name"] == pname and p["type"] == ptype
+            ),
+            None,
+        )
         if not pr:
             await edit_or_send(
-                update, context, SAFE_TXT,
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]])
+                update,
+                context,
+                SAFE_TXT,
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]
+                ),
             )
             return
         if ptype == "xray":
@@ -1949,15 +2517,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Кнопки: выдачу настроек показываем только если активен
             rows = []
             if status == "active":
-                rows.append([InlineKeyboardButton("📱 Получить настройки", callback_data=f"prof_get_app:{pname}")])
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            "📱 Получить настройки",
+                            callback_data=f"prof_get_app:{pname}",
+                        )
+                    ]
+                )
             else:
                 # подсказывающее сообщение
                 if status == "suspended":
-                    lines.append("Профиль приостановлен администратором — выдача ключей временно недоступна.")
+                    lines.append(
+                        "Профиль приостановлен администратором — выдача ключей временно недоступна."
+                    )
                 else:
-                    lines.append("Профиль не найден на сервере Xray — обратитесь к администратору или пересоздайте конфигурацию.")
+                    lines.append(
+                        "Профиль не найден на сервере Xray — обратитесь к администратору или пересоздайте конфигурацию."
+                    )
 
-            rows.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"prof_del:{pname}:{ptype}")])
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "🗑 Удалить", callback_data=f"prof_del:{pname}:{ptype}"
+                    )
+                ]
+            )
             rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")])
             kb = InlineKeyboardMarkup(rows)
             text = "\n".join(lines)
@@ -1967,14 +2552,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info = AWG.find_user(u.id, pname)
             if not info:
                 await edit_or_send(
-                    update, context, "Конфигурация AmneziaWG не найдена в конфиге сервера.",
-                    InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]])
+                    update,
+                    context,
+                    "Конфигурация AmneziaWG не найдена в конфиге сервера.",
+                    InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]
+                    ),
                 )
                 return
             kb = InlineKeyboardMarkup(
                 [
-                    [InlineKeyboardButton("🔑 Ключ для Amnezia (vpn://)", callback_data=f"prof_get_vpn:{pname}")],
-                    [InlineKeyboardButton("🗑 Удалить", callback_data=f"prof_del:{pname}:amneziawg")],
+                    [
+                        InlineKeyboardButton(
+                            "🔑 Ключ для Amnezia (vpn://)",
+                            callback_data=f"prof_get_vpn:{pname}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🗑 Удалить", callback_data=f"prof_del:{pname}:amneziawg"
+                        )
+                    ],
                     [InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")],
                 ]
             )
@@ -1991,8 +2589,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prof = next((p for p in profiles_active(user) if p.get("name") == pname), None)
         if not prof:
             await edit_or_send(
-                update, context, "Конфигурация не найдена.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]])
+                update,
+                context,
+                "Конфигурация не найдена.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]
+                ),
             )
             return
         ptype = prof.get("type")
@@ -2000,16 +2602,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info_x = XR.find_user(u.id, pname)
             if not info_x:
                 await edit_or_send(
-                    update, context, "Конфигурация Xray не найдена в конфиге сервера.",
-                    InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]])
+                    update,
+                    context,
+                    "Конфигурация Xray не найдена в конфиге сервера.",
+                    InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]
+                    ),
                 )
                 return
-            wrapper = build_amnezia_wrapper_json(pname, XRAY_CONNECT_HOST, info_x["port"], info_x["last_config_str"])
+            wrapper = build_amnezia_wrapper_json(
+                pname, XRAY_CONNECT_HOST, info_x["port"], info_x["last_config_str"]
+            )
             vpn_str = make_vpn_url_from_json_str(wrapper)
-            text = f"<b>{pname} — ключи для Amnezia (Xray)</b>\n\n<code>{vpn_str}</code>"
+            text = (
+                f"<b>{pname} — ключи для Amnezia (Xray)</b>\n\n<code>{vpn_str}</code>"
+            )
             await edit_or_send(
-                update, context, text,
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]),
+                update,
+                context,
+                text,
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]
+                ),
                 parse_mode="HTML",
             )
             return
@@ -2018,28 +2632,43 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if stored_vpn:
                 text = f"<b>{pname} — ключи для Amnezia (AmneziaWG)</b>\n\n<code>{stored_vpn}</code>"
                 await edit_or_send(
-                    update, context, text,
-                    InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]),
+                    update,
+                    context,
+                    text,
+                    InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]
+                    ),
                     parse_mode="HTML",
                 )
                 return
             info_wg = AWG.find_user(u.id, pname)
             if info_wg:
                 await edit_or_send(
-                    update, context,
+                    update,
+                    context,
                     "Конфигурация AmneziaWG была создана старой версией бота без сохранения vpn://. "
                     "Пересоздайте конфигурацию, чтобы получить импорт одной строкой.",
-                    InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]])
+                    InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]
+                    ),
                 )
                 return
             await edit_or_send(
-                update, context, "Конфигурация AmneziaWG не найдена.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]])
+                update,
+                context,
+                "Конфигурация AmneziaWG не найдена.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]
+                ),
             )
             return
         await edit_or_send(
-            update, context, "Неизвестный тип конфигурации.",
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]])
+            update,
+            context,
+            "Неизвестный тип конфигурации.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]
+            ),
         )
         return
 
@@ -2048,33 +2677,49 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_enum, status_label = xray_profile_status_for_user(user, u.id, pname)
         if status_enum != "active":
             await edit_or_send(
-                update, context,
+                update,
+                context,
                 f"<b>{pname}</b> · Xray\nСтатус: <b>{status_label}</b>\n\nВыдача URI недоступна.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]),
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]
+                ),
                 parse_mode="HTML",
             )
             return
         info = XR.find_user(u.id, pname)
         if not info:
             await edit_or_send(
-                update, context, "Конфигурация Xray не найдена в конфиге сервера.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]])
+                update,
+                context,
+                "Конфигурация Xray не найдена в конфиге сервера.",
+                InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]
+                ),
             )
             return
 
     if data.startswith("prof_del:"):
         _, pname, ptype = data.split(":", 2)
-        kb = InlineKeyboardMarkup([
+        kb = InlineKeyboardMarkup(
             [
-                InlineKeyboardButton("✅ Да, удалить", callback_data=f"prof_del_confirm:{pname}:{ptype}"),
-                InlineKeyboardButton("❌ Отмена", callback_data=f"prof_open:{pname}:{ptype}"),
-            ],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")],
-        ])
+                [
+                    InlineKeyboardButton(
+                        "✅ Да, удалить",
+                        callback_data=f"prof_del_confirm:{pname}:{ptype}",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Отмена", callback_data=f"prof_open:{pname}:{ptype}"
+                    ),
+                ],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")],
+            ]
+        )
         await edit_or_send(
-            update, context,
+            update,
+            context,
             f"Удалить конфигурацию <b>{pname}</b> ({ptype})? Это действие необратимо.",
-            kb, parse_mode="HTML"
+            kb,
+            parse_mode="HTML",
         )
         return
 
@@ -2091,51 +2736,95 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = load_state()
         user = ensure_user_bucket(st, u.id, u.username or "", u.first_name or "")
         for p in user.get("profiles", []):
-            if p.get("name") == pname and p.get("type") == ptype and not p.get("deleted"):
+            if (
+                p.get("name") == pname
+                and p.get("type") == ptype
+                and not p.get("deleted")
+            ):
                 p["deleted"] = True
                 p["deleted_at"] = now_iso()
                 break
         save_state(st)
-        txt = "Конфигурация удалена ✅" if ok else "Конфигурация не найдена на сервере, но помечена удалённой локально."
-        await edit_or_send(update, context, txt, InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]))
+        txt = (
+            "Конфигурация удалена ✅"
+            if ok
+            else "Конфигурация не найдена на сервере, но помечена удалённой локально."
+        )
+        await edit_or_send(
+            update,
+            context,
+            txt,
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]
+            ),
+        )
         return
-
 
     if data.startswith("prof_get_app:"):
         pname = data.split(":", 1)[1]
         await show_app_picker(update, context, pname, for_edit=True)
         return
 
-
     if data.startswith("prof_app_generic:"):
         pname = data.split(":", 1)[1]
         status, _ = xray_profile_status_for_user(user, update.effective_user.id, pname)
         if status != "active":
             msg = "Профиль недоступен для выдачи настроек: "
-            msg += "приостановлен ⏸." if status == "suspended" else "отсутствует в Xray ⚠️."
+            msg += (
+                "приостановлен ⏸." if status == "suspended" else "отсутствует в Xray ⚠️."
+            )
             await edit_or_send(
-                update, context, msg,
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"prof_get_app:{pname}")]])
+                update,
+                context,
+                msg,
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад", callback_data=f"prof_get_app:{pname}"
+                            )
+                        ]
+                    ]
+                ),
             )
             return
 
         info = XR.find_user(update.effective_user.id, pname)
         if not info:
             await edit_or_send(
-                update, context,
+                update,
+                context,
                 "Конфигурация Xray не найдена в конфиге сервера.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"prof_get_app:{pname}")]])
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад", callback_data=f"prof_get_app:{pname}"
+                            )
+                        ]
+                    ]
+                ),
             )
             return
         vless = info["uri"]
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🧾 Показать QR-код", callback_data=f"prof_toggle_qr_vless:{pname}:showqr")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data=f"prof_get_app:{pname}")],
-        ])
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🧾 Показать QR-код",
+                        callback_data=f"prof_toggle_qr_vless:{pname}:showqr",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад", callback_data=f"prof_get_app:{pname}"
+                    )
+                ],
+            ]
+        )
         txt = f"<b>{pname}</b> · VLESS (для v2rayNG / Nekoray / Clash)\n\n<code>{vless}</code>"
         await edit_or_send(update, context, txt, kb, parse_mode="HTML")
         return
-
 
     if data.startswith("prof_toggle_qr_vless:"):
         _, rest = data.split(":", 1)
@@ -2145,18 +2834,36 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status, _ = xray_profile_status_for_user(user, update.effective_user.id, pname)
         if status != "active":
             await edit_or_send(
-                update, context,
+                update,
+                context,
                 "Профиль недоступен: неактивен для выдачи QR.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"prof_get_app:{pname}")]])
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад", callback_data=f"prof_get_app:{pname}"
+                            )
+                        ]
+                    ]
+                ),
             )
             return
 
         info = XR.find_user(update.effective_user.id, pname)
         if not info:
             await edit_or_send(
-                update, context,
+                update,
+                context,
                 "Конфигурация Xray не найдена в конфиге сервера.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"prof_get_app:{pname}")]])
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад", callback_data=f"prof_get_app:{pname}"
+                            )
+                        ]
+                    ]
+                ),
             )
             return
 
@@ -2167,7 +2874,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if update and update.callback_query and update.callback_query.message:
                 await context.bot.delete_message(
                     chat_id=update.effective_chat.id,
-                    message_id=update.callback_query.message.message_id
+                    message_id=update.callback_query.message.message_id,
                 )
         except Exception:
             pass
@@ -2176,10 +2883,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ud = context.user_data
         if action == "showqr":
             png = _qr_png_bytes(vless)
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔗 Показать URI", callback_data=f"prof_toggle_qr_vless:{pname}:showuri")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data=f"prof_get_app:{pname}")],
-            ])
+            kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔗 Показать URI",
+                            callback_data=f"prof_toggle_qr_vless:{pname}:showuri",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ Назад", callback_data=f"prof_get_app:{pname}"
+                        )
+                    ],
+                ]
+            )
             msg = await context.bot.send_photo(
                 chat_id=update.effective_chat.id,
                 photo=png,
@@ -2190,17 +2908,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # action == "showuri"
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🧾 Показать QR-код", callback_data=f"prof_toggle_qr_vless:{pname}:showqr")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data=f"prof_get_app:{pname}")],
-        ])
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🧾 Показать QR-код",
+                        callback_data=f"prof_toggle_qr_vless:{pname}:showqr",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад", callback_data=f"prof_get_app:{pname}"
+                    )
+                ],
+            ]
+        )
         txt = f"<b>{pname}</b> · VLESS (для v2rayNG / Nekoray / Clash)\n\n<code>{vless}</code>"
         msg = await update.effective_chat.send_message(
             txt, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True
         )
         ud["last_bot_msg_id"] = msg.message_id
         return
-
 
     if data.startswith("prof_app_amnezia:"):
         pname = data.split(":", 1)[1]
@@ -2209,12 +2937,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = ensure_user_bucket(st, u.id, u.username or "", u.first_name or "")
         save_state(st)
 
-        pr = next((p for p in profiles_active(user) if p.get("name") == pname and p.get("type") == "xray"), None)
+        pr = next(
+            (
+                p
+                for p in profiles_active(user)
+                if p.get("name") == pname and p.get("type") == "xray"
+            ),
+            None,
+        )
         if not pr:
             await edit_or_send(
-                update, context,
+                update,
+                context,
                 "Конфигурация не найдена.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"prof_get_app:{pname}")]])
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад", callback_data=f"prof_get_app:{pname}"
+                            )
+                        ]
+                    ]
+                ),
             )
             return
 
@@ -2222,9 +2966,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_enum, status_label = xray_profile_status_for_user(user, u.id, pname)  # ★
         if status_enum != "active":  # ★
             await edit_or_send(  # ★
-                update, context,  # ★
+                update,
+                context,  # ★
                 f"<b>{pname}</b> · Xray\nСтатус: <b>{status_label}</b>\n\nВыдача ключей для Amnezia недоступна.",  # ★
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"prof_open:{pname}:xray")]]),  # ★
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад", callback_data=f"prof_open:{pname}:xray"
+                            )
+                        ]
+                    ]
+                ),  # ★
                 parse_mode="HTML",  # ★
             )  # ★
             return  # ★
@@ -2232,28 +2985,49 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info_x = XR.find_user(u.id, pname)
         if not info_x:
             await edit_or_send(
-                update, context,
+                update,
+                context,
                 "Конфигурация Xray не найдена в конфиге сервера.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"prof_get_app:{pname}")]])
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад", callback_data=f"prof_get_app:{pname}"
+                            )
+                        ]
+                    ]
+                ),
             )
             return
 
         status, _ = xray_profile_status_for_user(user, u.id, pname)
         if status != "active":
             await edit_or_send(
-                update, context,
+                update,
+                context,
                 "Профиль недоступен для импорта в Amnezia: не активен.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"prof_get_app:{pname}")]])
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "⬅️ Назад", callback_data=f"prof_get_app:{pname}"
+                            )
+                        ]
+                    ]
+                ),
             )
             return
 
-        wrapper = build_amnezia_wrapper_json(pname, XRAY_CONNECT_HOST, info_x["port"], info_x["last_config_str"])
+        wrapper = build_amnezia_wrapper_json(
+            pname, XRAY_CONNECT_HOST, info_x["port"], info_x["last_config_str"]
+        )
         vpn_str = make_vpn_url_from_json_str(wrapper)
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"prof_get_app:{pname}")]])
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Назад", callback_data=f"prof_get_app:{pname}")]]
+        )
         txt = f"<b>{pname} — ключ для Amnezia</b>\n\n<code>{vpn_str}</code>"
         await edit_or_send(update, context, txt, kb, parse_mode="HTML")
         return
-
 
     if data == "help_menu":
         txt = (
@@ -2264,7 +3038,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await edit_or_send(update, context, txt, back_kb("menu"))
         return
-
 
     # ===== /sync: фильтры/режим/обновление =====
     if data.startswith("sync_filter:"):
@@ -2277,7 +3050,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("sync_mode:"):
         mode = data.split(":", 1)[1]
-        if mode not in ("compact","detailed"):
+        if mode not in ("compact", "detailed"):
             mode = SYNC_DEFAULT_MODE
         flt = context.chat_data.get("sync_filter", SYNC_DEFAULT_FILTER)
         await _sync_report_send_or_edit(update, context, flt, mode)
@@ -2288,7 +3061,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode = context.chat_data.get("sync_mode", SYNC_DEFAULT_MODE)
         await _sync_report_send_or_edit(update, context, flt, mode)
         return
-
 
     # ===== Админские колбэки =====
     if data.startswith("admin_approve:"):
@@ -2302,7 +3074,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tu["allowed_at"] = now_iso()
         tu["allowed_by"] = update.effective_user.id
         save_state(st)
-        await edit_or_send(update, context, f"Доступ выдан пользователю <code>{target_id}</code>.", parse_mode="HTML")
+        await edit_or_send(
+            update,
+            context,
+            f"Доступ выдан пользователю <code>{target_id}</code>.",
+            parse_mode="HTML",
+        )
         try:
             await context.bot.send_message(
                 chat_id=target_id,
@@ -2320,8 +3097,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "admin_add":
         context.user_data["admin_mode"] = "await_user_id_or_username"
         await edit_or_send(
-            update, context, "Отправьте ID пользователя или @username для выдачи доступа.",
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_menu")]])
+            update,
+            context,
+            "Отправьте ID пользователя или @username для выдачи доступа.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="admin_menu")]]
+            ),
         )
         return
 
@@ -2359,11 +3140,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _notify_user_simple(
                 context,
                 int(tid),
-                "✅ Вам вновь выдан доступ к боту. Откройте меню, чтобы управлять конфигурациями."
+                "✅ Вам вновь выдан доступ к боту. Откройте меню, чтобы управлять конфигурациями.",
             )
 
             # Остаёмся на той же карточке
-            await show_admin_user_card(update, context, tid, replace=True, note="✅ Доступ разрешён.")
+            await show_admin_user_card(
+                update, context, tid, replace=True, note="✅ Доступ разрешён."
+            )
             return
 
         # Запрещаем доступ + автоприостановка Xray
@@ -2371,7 +3154,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_state(st)
 
         # Промежуточный лоудер в ТОЙ ЖЕ карточке
-        await edit_or_send(update, context, "⏳ Приостанавливаю Xray-профили пользователя…", None, parse_mode="HTML", edit_last=True)
+        await edit_or_send(
+            update,
+            context,
+            "⏳ Приостанавливаю Xray-профили пользователя…",
+            None,
+            parse_mode="HTML",
+            edit_last=True,
+        )
 
         total, done, skipped = _auto_suspend_all_xray(st, int(tid))
         save_state(st)
@@ -2380,10 +3170,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context,
             int(tid),
             "⛔ Ваш доступ к боту отозван."
-            + (f"\n⏸ Ваши Xray-профили приостановлены ({done} из {total})." if total else "")
+            + (
+                f"\n⏸ Ваши Xray-профили приостановлены ({done} из {total})."
+                if total
+                else ""
+            ),
         )
 
-        note = f"⛔ Доступ запрещён. ⏸ Приостановлено: {done} из {total}." + (f" Пропущено: {skipped}." if skipped else "")
+        note = f"⛔ Доступ запрещён. ⏸ Приостановлено: {done} из {total}." + (
+            f" Пропущено: {skipped}." if skipped else ""
+        )
         # Возвращаемся на карточку пользователя (без перехода в список конфигов)
         await show_admin_user_card(update, context, tid, replace=True, note=note)
         return
@@ -2400,17 +3196,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("admin_prof_del:"):
         _, tid, pname, ptype = data.split(":", 3)
-        kb = InlineKeyboardMarkup([
+        kb = InlineKeyboardMarkup(
             [
-                InlineKeyboardButton("✅ Да, удалить", callback_data=f"admin_prof_del_confirm:{tid}:{pname}:{ptype}"),
-                InlineKeyboardButton("❌ Отмена", callback_data=f"admin_prof_open:{tid}:{pname}:{ptype}"),
-            ],
-            [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_user_profiles:{tid}")],
-        ])
+                [
+                    InlineKeyboardButton(
+                        "✅ Да, удалить",
+                        callback_data=f"admin_prof_del_confirm:{tid}:{pname}:{ptype}",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Отмена",
+                        callback_data=f"admin_prof_open:{tid}:{pname}:{ptype}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Назад", callback_data=f"admin_user_profiles:{tid}"
+                    )
+                ],
+            ]
+        )
         await edit_or_send(
-            update, context,
+            update,
+            context,
             f"Удалить конфигурацию <b>{pname}</b> ({ptype}) у пользователя <code>{tid}</code>?",
-            kb, parse_mode="HTML"
+            kb,
+            parse_mode="HTML",
         )
         return
 
@@ -2426,22 +3236,37 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = load_state()
         urec = st["users"].get(tid, {})
         for p in urec.get("profiles", []):
-            if p.get("name") == pname and p.get("type") == ptype and not p.get("deleted"):
+            if (
+                p.get("name") == pname
+                and p.get("type") == ptype
+                and not p.get("deleted")
+            ):
                 p["deleted"] = True
                 p["deleted_at"] = now_iso()
                 break
         save_state(st)
-        await show_admin_user_profiles(update, context, tid, note="Конфигурация удалена.")
+        await show_admin_user_profiles(
+            update, context, tid, note="Конфигурация удалена."
+        )
         return
-    
+
     if data.startswith("admin_prof_suspend:"):
         _, tid, pname = data.split(":", 2)
         # найти профиль в state
         st = load_state()
         urec = st["users"].get(tid, {})
-        pr = next((p for p in profiles_active(urec) if p.get("name")==pname and p.get("type")=="xray"), None)
+        pr = next(
+            (
+                p
+                for p in profiles_active(urec)
+                if p.get("name") == pname and p.get("type") == "xray"
+            ),
+            None,
+        )
         if not pr:
-            await show_admin_user_profiles(update, context, tid, note="Профиль не найден.")
+            await show_admin_user_profiles(
+                update, context, tid, note="Профиль не найден."
+            )
             return
         # вызвать XR.suspend_user_by_name
         snap = XR.suspend_user_by_name(int(tid), pname)
@@ -2450,9 +3275,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pr["susp_uuid"] = snap.get("uuid")
             pr["susp_flow"] = snap.get("flow")
             save_state(st)
-            await show_admin_profile_card(update, context, tid, pname, "xray", note="Профиль приостановлен.")
+            await show_admin_profile_card(
+                update, context, tid, pname, "xray", note="Профиль приостановлен."
+            )
         else:
-            await show_admin_profile_card(update, context, tid, pname, "xray", note="Профиль уже отсутствует в Xray (возможно, уже приостановлен/удалён).")
+            await show_admin_profile_card(
+                update,
+                context,
+                tid,
+                pname,
+                "xray",
+                note="Профиль уже отсутствует в Xray (возможно, уже приостановлен/удалён).",
+            )
         return
 
     if data.startswith("admin_prof_resume:"):
@@ -2461,13 +3295,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         urec = st["users"].get(tid, {})
         # ⬇️ блок: если доступ снят — сразу выходим с пояснением
         if not urec.get("allowed", False):
-            await show_admin_profile_card(update, context, tid, pname, "xray",
-                                          note="🔒 Доступ у пользователя снят — возобновление отклонено.")
+            await show_admin_profile_card(
+                update,
+                context,
+                tid,
+                pname,
+                "xray",
+                note="🔒 Доступ у пользователя снят — возобновление отклонено.",
+            )
             return
 
-        pr = next((p for p in profiles_active(urec) if p.get("name")==pname and p.get("type")=="xray"), None)
+        pr = next(
+            (
+                p
+                for p in profiles_active(urec)
+                if p.get("name") == pname and p.get("type") == "xray"
+            ),
+            None,
+        )
         if not pr:
-            await show_admin_user_profiles(update, context, tid, note="Профиль не найден.")
+            await show_admin_user_profiles(
+                update, context, tid, note="Профиль не найден."
+            )
             return
         uuid = pr.get("susp_uuid") or pr.get("uuid")
         flow = pr.get("susp_flow")  # опционально
@@ -2478,9 +3327,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pr["suspended"] = False
             pr["uuid"] = uuid
             save_state(st)
-            await show_admin_profile_card(update, context, tid, pname, "xray", note="Профиль возобновлён.")
+            await show_admin_profile_card(
+                update, context, tid, pname, "xray", note="Профиль возобновлён."
+            )
         else:
-            await show_admin_profile_card(update, context, tid, pname, "xray", note="Не удалось возобновить (см. логи).")
+            await show_admin_profile_card(
+                update,
+                context,
+                tid,
+                pname,
+                "xray",
+                note="Не удалось возобновить (см. логи).",
+            )
         return
 
     # === Массово: приостановить все Xray профили пользователя ===
@@ -2489,11 +3347,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = load_state()
         urec = st["users"].get(tid, {})
         if not urec:
-            await edit_or_send(update, context, "Пользователь не найден.", back_kb("admin_list"))
+            await edit_or_send(
+                update, context, "Пользователь не найден.", back_kb("admin_list")
+            )
             return
 
         # ⏳ предварительное уведомление
-        await edit_or_send(update, context, "⏳ Приостанавливаю все Xray-профили…", None)
+        await edit_or_send(
+            update, context, "⏳ Приостанавливаю все Xray-профили…", None
+        )
 
         total = done = skipped = 0
         for p in profiles_active(urec):
@@ -2513,7 +3375,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 skipped += 1
 
         save_state(st)
-        note = f"⏸ Приостановлено: {done} из {total}." + (f" Пропущено: {skipped}." if skipped else "")
+        note = f"⏸ Приостановлено: {done} из {total}." + (
+            f" Пропущено: {skipped}." if skipped else ""
+        )
         await show_admin_user_profiles(update, context, tid, note=note)
         return
 
@@ -2523,14 +3387,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = load_state()
         urec = st["users"].get(tid, {})
         if not urec:
-            await edit_or_send(update, context, "Пользователь не найден.", back_kb("admin_list"))
+            await edit_or_send(
+                update, context, "Пользователь не найден.", back_kb("admin_list")
+            )
             return
 
         # ⬇️ блокирующая проверка
         if not urec.get("allowed", False):
             await show_admin_user_profiles(
-                update, context, tid,
-                note="🔒 Доступ у пользователя снят — массовое возобновление заблокировано."
+                update,
+                context,
+                tid,
+                note="🔒 Доступ у пользователя снят — массовое возобновление заблокировано.",
             )
             return
 
@@ -2559,16 +3427,58 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 skipped += 1
 
         save_state(st)
-        note = f"▶️ Возобновлено: {done} из {total}." + (f" Пропущено: {skipped}." if skipped else "")
+        note = f"▶️ Возобновлено: {done} из {total}." + (
+            f" Пропущено: {skipped}." if skipped else ""
+        )
         await show_admin_user_profiles(update, context, tid, note=note)
         return
+    # === /sync массовые действия (только "свои" записи) ===
+    if data == "sync_apply_absent_all":
+        # запускаем массовое добавление отсутствующих (только не suspended)
+        summary = sync_absent_apply_all()
+        text = (
+            "🧩 <b>Починка отсутствующих завершена</b>\n"
+            f"Всего: <b>{summary.get('total',0)}</b>\n"
+            f"Выполнено: <b>{summary.get('done',0)}</b>\n"
+            f"Пропущено: <b>{summary.get('skipped',0)}</b>\n"
+            f"Ошибок: <b>{summary.get('errors',0)}</b>\n"
+        )
+        # покажем краткий результат и обновим отчёт
+        await _edit_cb_with_fallback(update, context, text, parse_mode="HTML")
+        flt = context.chat_data.get("sync_filter", SYNC_DEFAULT_FILTER)
+        mode = context.chat_data.get("sync_mode", SYNC_DEFAULT_MODE)
+        await _sync_report_send_or_edit(update, context, flt, mode)
+        return
 
+    if data == "sync_apply_extra_all":
+        # запускаем массовое удаление лишних (только source=bot)
+        summary = sync_extra_apply_all()
+        text = (
+            "🧹 <b>Удаление лишних завершено</b>\n"
+            f"Всего: <b>{summary.get('total',0)}</b>\n"
+            f"Выполнено: <b>{summary.get('done',0)}</b>\n"
+            f"Пропущено: <b>{summary.get('skipped',0)}</b>\n"
+            f"Ошибок: <b>{summary.get('errors',0)}</b>\n"
+        )
+        await _edit_cb_with_fallback(update, context, text, parse_mode="HTML")
+        flt = context.chat_data.get("sync_filter", SYNC_DEFAULT_FILTER)
+        mode = context.chat_data.get("sync_mode", SYNC_DEFAULT_MODE)
+        await _sync_report_send_or_edit(update, context, flt, mode)
+        return
 
     if data == "admin_sync":
         # Лоудер: если текущее сообщение не последнее — отправим новое и удалим старое
         try:
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_menu")]])
-            await _edit_cb_with_fallback(update, context, "⏳ Загружаю отчёт по синхронизации…", kb=kb, parse_mode="HTML")
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="admin_menu")]]
+            )
+            await _edit_cb_with_fallback(
+                update,
+                context,
+                "⏳ Загружаю отчёт по синхронизации…",
+                kb=kb,
+                parse_mode="HTML",
+            )
         except Exception:
             pass
 
@@ -2577,7 +3487,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data["_suppress_log_once"] = True
         await cmd_sync(update, context)
         return
-
 
     if data == "admin_sync_refresh":
         # просто показать заново страницу 0 (свежая проба)
@@ -2596,12 +3505,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _sync_show(update, context, page=page)
         return
 
-
     if data == "status_health":
         context.chat_data["_allow_nested_from_cb"] = True
         context.chat_data["_suppress_log_once"] = True
         await cmd_health(update, context)
         return
+
 
 @with_request_id
 @log_command
@@ -2624,12 +3533,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Пустая строка
         if not orig:
-            await update.message.reply_text("Имя пустое. Введите имя латиницей: буквы, цифры, точка, дефис или подчёркивание.")
+            await update.message.reply_text(
+                "Имя пустое. Введите имя латиницей: буквы, цифры, точка, дефис или подчёркивание."
+            )
             return
 
         # Недопустимые символы — не принимаем (не молча заменяем)
         if orig != name:
-            await update.message.reply_text("Недопустимые символы. Разрешены: A–Z, a–z, 0–9, точка ., дефис -, подчёркивание _. Без пробелов.")
+            await update.message.reply_text(
+                "Недопустимые символы. Разрешены: A–Z, a–z, 0–9, точка ., дефис -, подчёркивание _. Без пробелов."
+            )
             return
 
         # Ограничение длины
@@ -2638,12 +3551,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         typ = context.user_data.get("create_typ", "xray")
         if md_limit_reached(user, typ):
-            limit_msg = f"Достигнут лимит для {('Xray' if typ=='xray' else 'AmneziaWG')}: " + (str(MAX_XRAY) if typ == "xray" else str(MAX_AWG))
+            limit_msg = (
+                f"Достигнут лимит для {('Xray' if typ=='xray' else 'AmneziaWG')}: "
+                + (str(MAX_XRAY) if typ == "xray" else str(MAX_AWG))
+            )
             await update.message.reply_text(limit_msg)
             context.user_data.pop("awaiting_name", None)
             return
-        if any(p["name"] == name and not p.get("deleted") for p in profiles_active(user)):
-            await update.message.reply_text("Конфигурация с таким именем уже существует. Введите другое имя.")
+        if any(
+            p["name"] == name and not p.get("deleted") for p in profiles_active(user)
+        ):
+            await update.message.reply_text(
+                "Конфигурация с таким именем уже существует. Введите другое имя."
+            )
             return
 
         try:
@@ -2659,8 +3579,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     }
                 )
                 save_state(st)
-                try: await update.message.delete()
-                except Exception: pass
+                try:
+                    await update.message.delete()
+                except Exception:
+                    pass
                 await show_app_picker(update, context, name, for_edit=True)
 
             elif typ in ("amneziawg", "awg"):
@@ -2676,9 +3598,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     }
                 )
                 save_state(st)
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="menu")]])
-                try: await update.message.delete()
-                except Exception: pass
+                kb = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ В меню", callback_data="menu")]]
+                )
+                try:
+                    await update.message.delete()
+                except Exception:
+                    pass
                 txt = (
                     f"<b>{name}</b> (AmneziaWG) создан ✅\n\n"
                     f"<b>Импорт в Amnezia:</b>\n<code>{created['vpn_url']}</code>\n\n"
@@ -2696,13 +3622,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-
-async def show_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
+async def show_admin_menu(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False
+):
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("➕ Добавить доступ", callback_data="admin_add")],
             [InlineKeyboardButton("👥 Все пользователи", callback_data="admin_list")],
-            [InlineKeyboardButton("🔄 Синхронизация (диагностика)", callback_data="admin_sync")],
+            [
+                InlineKeyboardButton(
+                    "🔄 Синхронизация (диагностика)", callback_data="admin_sync"
+                )
+            ],
             [InlineKeyboardButton("⬅️ В меню", callback_data="menu")],
         ]
     )
@@ -2711,6 +3642,7 @@ async def show_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, ed
         await update.callback_query.edit_message_text(txt, reply_markup=kb)
     else:
         await edit_or_send(update, context, txt, kb)
+
 
 @autoclean_command_input
 @with_request_id
@@ -2741,28 +3673,42 @@ def resolve_user_id(arg: str) -> Optional[int]:
             return None
     return None
 
+
 @autoclean_command_input
 @admin_only
 async def cmd_allow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arg = " ".join(context.args) if context.args else ""
     tid = resolve_user_id(arg)
     if not tid:
-        await update.message.reply_text("Укажите ID или @username: /allow 123456 или /allow @user")
+        await update.message.reply_text(
+            "Укажите ID или @username: /allow 123456 или /allow @user"
+        )
         return
     st = load_state()
     urec = st["users"].setdefault(
         str(tid),
-        {"allowed": False, "username": "", "first_name": "", "profiles": [], "created_at": now_iso()},
+        {
+            "allowed": False,
+            "username": "",
+            "first_name": "",
+            "profiles": [],
+            "created_at": now_iso(),
+        },
     )
     urec["allowed"] = True
     urec["allowed_at"] = now_iso()
     urec["allowed_by"] = update.effective_user.id
     save_state(st)
-    await update.message.reply_text(f"✅ Доступ выдан <code>{tid}</code>", parse_mode="HTML")
+    await update.message.reply_text(
+        f"✅ Доступ выдан <code>{tid}</code>", parse_mode="HTML"
+    )
     try:
-        await context.bot.send_message(chat_id=tid, text="✅ Доступ к боту одобрен. Воспользуйтесь меню.")
+        await context.bot.send_message(
+            chat_id=tid, text="✅ Доступ к боту одобрен. Воспользуйтесь меню."
+        )
     except Exception:
         pass
+
 
 @autoclean_command_input
 @admin_only
@@ -2770,7 +3716,9 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arg = " ".join(context.args) if context.args else ""
     tid = resolve_user_id(arg)
     if not tid:
-        await update.message.reply_text("Укажите ID или @username: /revoke 123456 или /revoke @user")
+        await update.message.reply_text(
+            "Укажите ID или @username: /revoke 123456 или /revoke @user"
+        )
         return
 
     st = load_state()
@@ -2796,14 +3744,18 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(msg_admin)
 
     # 4) уведомление пользователю (опционально)
-    note_user = (
-        "⛔ Ваш доступ к боту отозван."
-        + (f"\n⏸ Ваши Xray-профили приостановлены ({done} из {total})." if total else "")
+    note_user = "⛔ Ваш доступ к боту отозван." + (
+        f"\n⏸ Ваши Xray-профили приостановлены ({done} из {total})." if total else ""
     )
     _notify_user_simple(context, tid, note_user)
 
 
-async def show_admin_user_list(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0, page_size: int = 10):
+async def show_admin_user_list(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    page: int = 0,
+    page_size: int = 10,
+):
     st = load_state()
     items = sorted(st["users"].items(), key=lambda kv: int(kv[0]))
     total = len(items)
@@ -2812,7 +3764,13 @@ async def show_admin_user_list(update: Update, context: ContextTypes.DEFAULT_TYP
     for tid, rec in items[start:end]:
         tag = "✅" if rec.get("allowed") else "⛔"
         uname = rec.get("username") or "-"
-        rows.append([InlineKeyboardButton(f"{tag} {tid} @{uname}", callback_data=f"admin_user_open:{tid}")])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{tag} {tid} @{uname}", callback_data=f"admin_user_open:{tid}"
+                )
+            ]
+        )
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️", callback_data=f"admin_list_page:{page-1}"))
@@ -2827,13 +3785,21 @@ async def show_admin_user_list(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.effective_chat.send_message(txt, reply_markup=kb)
 
 
-async def show_admin_user_card(update: Update, context: ContextTypes.DEFAULT_TYPE, tid: str, replace: bool = False, note: str = ""):
+async def show_admin_user_card(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    tid: str,
+    replace: bool = False,
+    note: str = "",
+):
     st = load_state()
     rec = st["users"].get(tid)
     if not rec:
         await update.effective_chat.send_message("Пользователь не найден.")
         return
-    tag = "✅ Разрешить → Запретить" if rec.get("allowed") else "⛔ Запретить → Разрешить"
+    tag = (
+        "✅ Разрешить → Запретить" if rec.get("allowed") else "⛔ Запретить → Разрешить"
+    )
 
     lines = [
         f"<b>Пользователь</b> <code>{tid}</code>",
@@ -2849,31 +3815,53 @@ async def show_admin_user_card(update: Update, context: ContextTypes.DEFAULT_TYP
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(tag, callback_data=f"admin_user_toggle:{tid}")],
-            [InlineKeyboardButton("Конфигурации пользователя", callback_data=f"admin_user_profiles:{tid}")],
+            [
+                InlineKeyboardButton(
+                    "Конфигурации пользователя",
+                    callback_data=f"admin_user_profiles:{tid}",
+                )
+            ],
             [InlineKeyboardButton("⬅️ Назад", callback_data="admin_list")],
         ]
     )
     await edit_or_send(update, context, txt, kb, parse_mode="HTML")
 
-async def show_admin_user_profiles(update: Update, context: ContextTypes.DEFAULT_TYPE, tid: str, note: str = ""):
+
+async def show_admin_user_profiles(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, tid: str, note: str = ""
+):
     st = load_state()
     rec = st["users"].get(tid, {})
     act = profiles_active(rec) if rec else []
 
     rows = []
     if not act:
-        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_user_open:{tid}")])
-        txt = (note + "\n" if note else "") + "У пользователя нет активных конфигураций."
-        await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(rows))
+        rows.append(
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_user_open:{tid}")]
+        )
+        txt = (
+            note + "\n" if note else ""
+        ) + "У пользователя нет активных конфигураций."
+        await update.callback_query.edit_message_text(
+            txt, reply_markup=InlineKeyboardMarkup(rows)
+        )
         return
 
     # ⬇️ новая логика: «возобновить все» только если доступ разрешён
     user_allowed = bool(rec.get("allowed", False))
     if user_allowed:
-        rows.append([
-            InlineKeyboardButton("⏸ Приостановить все Xray", callback_data=f"admin_user_suspend_all_xray:{tid}"),
-            InlineKeyboardButton("▶️ Возобновить все Xray",   callback_data=f"admin_user_resume_all_xray:{tid}"),
-        ])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "⏸ Приостановить все Xray",
+                    callback_data=f"admin_user_suspend_all_xray:{tid}",
+                ),
+                InlineKeyboardButton(
+                    "▶️ Возобновить все Xray",
+                    callback_data=f"admin_user_resume_all_xray:{tid}",
+                ),
+            ]
+        )
         # необязательно, но полезно: пояснение в тексте ниже
 
     for p in act:
@@ -2890,17 +3878,38 @@ async def show_admin_user_profiles(update: Update, context: ContextTypes.DEFAULT
                 label = f"{label} · {'▶️' if present else '⚠️'}"
         else:
             label = f"{label} · {ptype}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"admin_prof_open:{tid}:{p['name']}:{ptype}")])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label, callback_data=f"admin_prof_open:{tid}:{p['name']}:{ptype}"
+                )
+            ]
+        )
 
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_user_open:{tid}")])
+    rows.append(
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_user_open:{tid}")]
+    )
 
     # добавим заметку для наглядности
-    msg_note = note or ("" if user_allowed else "🔒 Доступ снят — возобновление профилей запрещено.")
-    txt = (msg_note + "\n" if msg_note else "") + f"Конфигурации пользователя <code>{tid}</code>:"
-    await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(rows), parse_mode="HTML")
+    msg_note = note or (
+        "" if user_allowed else "🔒 Доступ снят — возобновление профилей запрещено."
+    )
+    txt = (
+        msg_note + "\n" if msg_note else ""
+    ) + f"Конфигурации пользователя <code>{tid}</code>:"
+    await update.callback_query.edit_message_text(
+        txt, reply_markup=InlineKeyboardMarkup(rows), parse_mode="HTML"
+    )
 
 
-async def show_admin_profile_card(update: Update, context: ContextTypes.DEFAULT_TYPE, tid: str, pname: str, ptype: str, note: str = ""):
+async def show_admin_profile_card(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    tid: str,
+    pname: str,
+    ptype: str,
+    note: str = "",
+):
     st = load_state()
     rec = st["users"].get(tid, {})
     pr = None
@@ -2911,7 +3920,15 @@ async def show_admin_profile_card(update: Update, context: ContextTypes.DEFAULT_
     if not pr:
         await update.callback_query.edit_message_text(
             "Конфигурация не найдена.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_user_profiles:{tid}")]]),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ Назад", callback_data=f"admin_user_profiles:{tid}"
+                        )
+                    ]
+                ]
+            ),
         )
         return
 
@@ -2957,16 +3974,42 @@ async def show_admin_profile_card(update: Update, context: ContextTypes.DEFAULT_
         is_susp = bool(pr.get("suspended"))
         # ⬇️ приостановить разрешаем ТОЛЬКО если есть доступ
         if user_allowed and (not is_susp) and xr_present:
-            rows.append([InlineKeyboardButton("⏸ Приостановить", callback_data=f"admin_prof_suspend:{tid}:{pname}")])
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "⏸ Приостановить",
+                        callback_data=f"admin_prof_suspend:{tid}:{pname}",
+                    )
+                ]
+            )
         # ▶️ показываем только если профиль приостановлен И доступ разрешён
         if is_susp and user_allowed:
-            rows.append([InlineKeyboardButton("▶️ Возобновить", callback_data=f"admin_prof_resume:{tid}:{pname}")])
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "▶️ Возобновить",
+                        callback_data=f"admin_prof_resume:{tid}:{pname}",
+                    )
+                ]
+            )
 
-    rows.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"admin_prof_del:{tid}:{pname}:{ptype}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_user_profiles:{tid}")])
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🗑 Удалить", callback_data=f"admin_prof_del:{tid}:{pname}:{ptype}"
+            )
+        ]
+    )
+    rows.append(
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_user_profiles:{tid}")]
+    )
 
     kb = InlineKeyboardMarkup(rows)
-    await update.callback_query.edit_message_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    await update.callback_query.edit_message_text(
+        "\n".join(lines), reply_markup=kb, parse_mode="HTML"
+    )
+
+
 @autoclean_command_input
 @with_request_id
 @log_command
@@ -2975,7 +4018,7 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Пороговые значения из ENV
     warn_sec = int(os.getenv("HEALTH_WARN_SEC", "60"))
     crit_sec = int(os.getenv("HEALTH_CRIT_SEC", "180"))
-    tcp_to   = int(os.getenv("HEALTH_TCP_TIMEOUT_MS", "800"))
+    tcp_to = int(os.getenv("HEALTH_TCP_TIMEOUT_MS", "800"))
 
     ok, warn, crit = [], [], []
 
@@ -3007,8 +4050,13 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 statuses[n] = s
             except Exception:
                 pass
-    need = (os.getenv("HEALTH_REQUIRE_CONTAINERS", "amnezia-awg,amnezia-xray,amnezia-dns,awgbot")
-            .strip().split(","))
+    need = (
+        os.getenv(
+            "HEALTH_REQUIRE_CONTAINERS", "amnezia-awg,amnezia-xray,amnezia-dns,awgbot"
+        )
+        .strip()
+        .split(",")
+    )
     for name in [x.strip() for x in need if x.strip()]:
         st = statuses.get(name, "")
         if not st:
@@ -3026,12 +4074,16 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     xray_c = os.getenv("XRAY_CONTAINER", "amnezia-xray")
     xray_cfg = os.getenv("XRAY_CONFIG_PATH", "/opt/amnezia/xray/server.json")
     rc_x, _, _ = _docker_exec(xray_c, f"test -r {shlex.quote(xray_cfg)}")
-    (ok if rc_x == 0 else crit).append("Xray конфиг OK" if rc_x == 0 else "Xray конфиг недоступен")
+    (ok if rc_x == 0 else crit).append(
+        "Xray конфиг OK" if rc_x == 0 else "Xray конфиг недоступен"
+    )
 
     awg_c = os.getenv("AWG_CONTAINER", "amnezia-awg")
     awg_cfg = os.getenv("AWG_CONFIG_PATH", "/opt/amnezia/awg/wg0.conf")
     rc_a, _, _ = _docker_exec(awg_c, f"test -r {shlex.quote(awg_cfg)}")
-    (ok if rc_a == 0 else crit).append("AmneziaWG конфиг OK" if rc_a == 0 else "AmneziaWG конфиг недоступен")
+    (ok if rc_a == 0 else crit).append(
+        "AmneziaWG конфиг OK" if rc_a == 0 else "AmneziaWG конфиг недоступен"
+    )
 
     # 5) /app/data
     try:
@@ -3039,8 +4091,14 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(tmp, "w", encoding="utf-8") as f:
             f.write("ok")
         os.remove(tmp)
-        rc_df, out_df, _ = run_cmd("df -h /app/data | tail -n 1 | awk '{print $4\" свободно (\"$5\" занято)\"}'")
-        ok.append(f"/app/data запись OK; {out_df}" if rc_df == 0 and out_df else "/app/data запись OK")
+        rc_df, out_df, _ = run_cmd(
+            'df -h /app/data | tail -n 1 | awk \'{print $4" свободно ("$5" занято)"}\''
+        )
+        ok.append(
+            f"/app/data запись OK; {out_df}"
+            if rc_df == 0 and out_df
+            else "/app/data запись OK"
+        )
     except Exception as e:
         crit.append(f"/app/data запись ошибка ({e})")
 
@@ -3052,15 +4110,21 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ports = set()
         # один порт точно: 443 (дефолт), плюс попробуем из docker ps вытащить опубликованный
         ports.add(443)
-        rc_pi, out_pi, _ = run_cmd("docker ps --format '{{.Names}}\\t{{.Ports}}' | grep amnezia-xray || true")
+        rc_pi, out_pi, _ = run_cmd(
+            "docker ps --format '{{.Names}}\\t{{.Ports}}' | grep amnezia-xray || true"
+        )
         if rc_pi == 0 and out_pi:
             # ищем "0.0.0.0:443->443/tcp"
             m = re.findall(r":(\d+)->\d+/(?:tcp|udp)", out_pi)
             for p in m:
-                try: ports.add(int(p))
-                except: pass
+                try:
+                    ports.add(int(p))
+                except:
+                    pass
         good = any(tcp_check(host, p, timeout_ms=tcp_to) for p in ports)
-        (ok if good else warn).append(f"Xray TCP порт {'OK' if good else 'недоступен'} ({host}:{'/'.join(map(str,ports))})")
+        (ok if good else warn).append(
+            f"Xray TCP порт {'OK' if good else 'недоступен'} ({host}:{'/'.join(map(str,ports))})"
+        )
     except Exception:
         warn.append("Xray TCP проверка не выполнена")
 
@@ -3069,9 +4133,11 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     emoji = "🟢" if not crit and not warn else ("🟡" if not crit else "🔴")
     lines = [f"{emoji} Health: {tldr}"]
     if crit:
-        lines.append("Критичное:"); lines += [f"• {x}" for x in crit]
+        lines.append("Критичное:")
+        lines += [f"• {x}" for x in crit]
     if warn:
-        lines.append("Предупреждения:"); lines += [f"• {x}" for x in warn]
+        lines.append("Предупреждения:")
+        lines += [f"• {x}" for x in warn]
     if not crit and not warn:
         lines.append("Все ключевые проверки в норме.")
 
@@ -3088,6 +4154,7 @@ async def cmd_boom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info({"event": "boom_triggered", "by": update.effective_user.id})
     # Намеренно кидаем исключение
     raise RuntimeError("💥 Искусственная ошибка для теста error-handler")
+
 
 @autoclean_command_input
 @with_request_id
@@ -3118,7 +4185,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         target_chat_id = update.effective_chat.id
-        target_msg_id  = update.callback_query.message.message_id
+        target_msg_id = update.callback_query.message.message_id
     else:
         # пришли /status — шлём новое сообщение с лоудером
         sent = await update.effective_message.reply_html(
@@ -3127,7 +4194,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=True,
         )
         target_chat_id = sent.chat.id
-        target_msg_id  = sent.message_id
+        target_msg_id = sent.message_id
 
     # 2) собрать и отрендерить полный статус
     probe = status_probe()
@@ -3165,14 +4232,18 @@ async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1) показываем лоудер именно в ТОМ ЖЕ сообщении (если пришли из callback),
     #    либо шлём новое и удаляем старое — это сделает _edit_cb_with_fallback
     await _edit_cb_with_fallback(
-        update, context,
+        update,
+        context,
         "⏳ Готовлю отчёт /sync…",
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_menu")]]),
+        kb=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Назад", callback_data="admin_menu")]]
+        ),
         parse_mode="HTML",
     )
 
     # 2) отрисовываем (перерисовываем) отчёт — внутри уже используется _edit_cb_with_fallback
     await _sync_report_send_or_edit(update, context, flt, mode)
+
 
 @autoclean_command_input
 @with_request_id
@@ -3259,7 +4330,9 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # если влезает в сообщение — шлём текстом, иначе — файлом
-    text = "```\n" + "\n".join(out_lines[-400:]) + "\n```"  # ограничим, чтобы точно влезало
+    text = (
+        "```\n" + "\n".join(out_lines[-400:]) + "\n```"
+    )  # ограничим, чтобы точно влезало
     if len(text) <= 3500:
         await update.effective_message.reply_markdown(text)
     else:
@@ -3269,9 +4342,9 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
             document=InputFile(buf),
-            caption=f"Последние {lines_count} строк лога" + (" (всё)" if show_all else " (ошибки)"),
+            caption=f"Последние {lines_count} строк лога"
+            + (" (всё)" if show_all else " (ошибки)"),
         )
-
 
 
 # ========= ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК =========
@@ -3295,26 +4368,32 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     rid = ensure_rid(context)
 
     # 1) Лог со стеком (всегда)
-    logger.exception({
-        "event": "handler_error",
-        "rid": rid,
-        "uid": uid,
-        "cmd": cmd,
-        "error_type": err_type,
-    })
+    logger.exception(
+        {
+            "event": "handler_error",
+            "rid": rid,
+            "uid": uid,
+            "cmd": cmd,
+            "error_type": err_type,
+        }
+    )
 
     # 2) Дружелюбный ответ пользователю
     try:
-        if hasattr(context, "bot") and hasattr(update, "effective_chat") and update.effective_chat:
+        if (
+            hasattr(context, "bot")
+            and hasattr(update, "effective_chat")
+            and update.effective_chat
+        ):
             if isinstance(err, TelegramError):
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
-                    text="⚠️ Временная ошибка Telegram API, попробуйте ещё раз."
+                    text="⚠️ Временная ошибка Telegram API, попробуйте ещё раз.",
                 )
             else:
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
-                    text="⚠️ Упс, произошла ошибка. Подробности уже в логах."
+                    text="⚠️ Упс, произошла ошибка. Подробности уже в логах.",
                 )
     except Exception:
         pass
@@ -3357,6 +4436,7 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 # ===== Watchdog: фоновая проверка окружения и зависимостей =====
 _WATCH_LAST_SENT_TS = 0  # антиспам уведомлений админу
 
+
 def _parse_docker_ps() -> dict:
     """Возвращает dict: name -> status строка"""
     rc, out, _ = run_cmd("docker ps --format '{{.Names}}\t{{.Status}}'")
@@ -3369,6 +4449,7 @@ def _parse_docker_ps() -> dict:
             except Exception:
                 pass
     return res
+
 
 def _status_severity(status: str) -> str:
     """
@@ -3396,11 +4477,14 @@ def _status_severity(status: str) -> str:
     # по умолчанию — подозрительно
     return "warn"
 
+
 def _status_is_ok(status: str) -> bool:
     return _status_severity(status) == "ok"
 
+
 def _status_is_warn(status: str) -> bool:
     return _status_severity(status) == "warn"
+
 
 def _watchdog_once() -> dict:
     """
@@ -3482,6 +4566,7 @@ def _watchdog_once() -> dict:
     tldr = f"OK={len(ok)}  WARN={len(warn)}  CRIT={len(crit)}"
     return {"ok": ok, "warn": warn, "crit": crit, "tldr": tldr}
 
+
 def _try_autorestart(statuses: dict, names: list[str]) -> list[str]:
     """Пробует рестартануть контейнеры из names, если они не ОК. Возвращает список перезапущенных."""
     restarted = []
@@ -3492,10 +4577,18 @@ def _try_autorestart(statuses: dict, names: list[str]) -> list[str]:
             if rc == 0:
                 restarted.append(name)
             else:
-                logger.warning({"event": "watchdog_restart_fail", "container": name, "error": err or rc})
+                logger.warning(
+                    {
+                        "event": "watchdog_restart_fail",
+                        "container": name,
+                        "error": err or rc,
+                    }
+                )
     return restarted
 
+
 import urllib.request, urllib.parse, ssl
+
 
 def _safe_send_telegram(text: str) -> None:
     """
@@ -3513,17 +4606,22 @@ def _safe_send_telegram(text: str) -> None:
     ctx = ssl.create_default_context()
     for aid in ADMIN_IDS:
         try:
-            data = urllib.parse.urlencode({
-                "chat_id": str(aid),
-                "text": text,
-                "disable_web_page_preview": "true",
-            }).encode("utf-8")
+            data = urllib.parse.urlencode(
+                {
+                    "chat_id": str(aid),
+                    "text": text,
+                    "disable_web_page_preview": "true",
+                }
+            ).encode("utf-8")
             req = urllib.request.Request(base, data=data, method="POST")
-            with urllib.request.urlopen(req, timeout=WATCHDOG_TG_TIMEOUT, context=ctx) as resp:
+            with urllib.request.urlopen(
+                req, timeout=WATCHDOG_TG_TIMEOUT, context=ctx
+            ) as resp:
                 if resp.status != 200:
                     logger.warning({"event": "watchdog_tg_non200", "code": resp.status})
         except Exception as e:
             logger.warning({"event": "watchdog_tg_send_fail", "error": str(e)})
+
 
 def _watchdog_notify_admins(msg: str):
     # и в лог запишем, и в Telegram отправим
@@ -3533,14 +4631,20 @@ def _watchdog_notify_admins(msg: str):
 
 def _watchdog_worker():
     global _WATCH_LAST_SENT_TS
-    logger.info({"event": "watchdog_start", "interval_sec": WATCHDOG_INTERVAL_SEC, "autorestart": WATCHDOG_AUTORESTART})
+    logger.info(
+        {
+            "event": "watchdog_start",
+            "interval_sec": WATCHDOG_INTERVAL_SEC,
+            "autorestart": WATCHDOG_AUTORESTART,
+        }
+    )
     while True:
         try:
             res = _watchdog_once()
             # NEW: игнорим WARN в первые N секунд после старта бота
             within_grace = (time.time() - _BOOT_TS) < WATCHDOG_BOOT_GRACE_SEC
             if within_grace:
-                issues = res["crit"][:]   # только критичное
+                issues = res["crit"][:]  # только критичное
             else:
                 issues = res["warn"] + res["crit"]
 
@@ -3571,13 +4675,17 @@ def _watchdog_worker():
 
                     _watchdog_notify_admins(text)
                 else:
-                    logger.info({"event": "watchdog_skip_notify", "cooldown_sec": WATCHDOG_COOLDOWN_SEC})
+                    logger.info(
+                        {
+                            "event": "watchdog_skip_notify",
+                            "cooldown_sec": WATCHDOG_COOLDOWN_SEC,
+                        }
+                    )
             else:
                 logger.info({"event": "watchdog_ok"})
         except Exception:
             logger.exception({"event": "watchdog_fail"})
         time.sleep(WATCHDOG_INTERVAL_SEC)
-
 
 
 # ========= РОУТИНГ =========
