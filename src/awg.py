@@ -1,212 +1,354 @@
-# awg.py
-import json, re, base64, zlib
-from typing import Dict, Any, List, Optional
-from util import (
-    docker_read_file, docker_write_file_atomic, docker_exec, shq,
-    get_awg_bin, AWG_CONTAINER, AWG_CONFIG_PATH, AWG_CONNECT_HOST, AWG_LISTEN_PORT
-)
+from __future__ import annotations
+from typing import Dict, Any, List, Optional, Tuple
+import ipaddress
+import os
 
-def _email(tg_id: int, name: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
-    return f"{tg_id}-{safe}"
+# Наши утилиты
+from core.docker import run_cmd
+from core.state import load_state
+from util import AWG_CONNECT_HOST
 
-def _server_listen_port() -> int:
-    # сначала wg0.conf
-    try:
-        wgconf = docker_read_file(AWG_CONTAINER, AWG_CONFIG_PATH)
-        for line in wgconf.splitlines():
-            m = re.match(r"\s*ListenPort\s*=\s*(\d+)\s*$", line)
-            if m: return int(m.group(1))
-    except Exception:
-        pass
-    # затем wg/awg show
-    try:
-        out = docker_exec(AWG_CONTAINER, "sh", "-lc", f"{get_awg_bin()} show 2>/dev/null || true")
-        mm = re.search(r"listening port:\s*(\d+)", out)
-        if mm: return int(mm.group(1))
-    except Exception:
-        pass
-    return AWG_LISTEN_PORT or 51280
+AWG_CONTAINER = os.getenv("AWG_CONTAINER", "amnezia-awg")
+WG_IFACE = os.getenv("AWG_IFACE", "wg0")
+CONF_DIR = "/opt/amnezia/awg"
+CONF_PATH = f"{CONF_DIR}/{WG_IFACE}.conf"
+PSK_PATH = f"{CONF_DIR}/wireguard_psk.key"
+SERVER_PUB_PATH = f"{CONF_DIR}/wireguard_server_public_key.key"
 
-def _server_pubkey() -> str:
-    try:
-        return docker_read_file(AWG_CONTAINER, "/opt/amnezia/awg/wireguard_server_public_key.key").strip()
-    except Exception:
-        try:
-            out = docker_exec(AWG_CONTAINER, "sh", "-lc", f"{get_awg_bin()} show 2>/dev/null || true")
-            mm = re.search(r"public key:\s*([A-Za-z0-9+/=\-]+)", out)
-            if mm: return mm.group(1).strip()
-        except Exception: pass
-    return ""
+# ==== низкоуровневые вызовы в контейнер ====
 
-def _next_ip() -> str:
-    try:
-        out = docker_exec(
-            AWG_CONTAINER, "sh", "-lc",
-            r'grep -oE "AllowedIPs[[:space:]]*=[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" '
-            + shq(AWG_CONFIG_PATH) +
-            r' | awk -F. "{print $4}" | sort -n | uniq || true'
-        )
-        used = {x.strip() for x in out.splitlines() if x.strip()}
-    except Exception:
-        used = set()
-    for i in range(1, 255):
-        if str(i) not in used:
-            return f"10.8.1.{i}/32"
-    raise RuntimeError("Нет свободных IP в 10.8.1.0/24")
 
-def _b64url(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+def _sh(cmd: str, timeout: int = 8) -> Tuple[int, str, str]:
+    """
+    Выполняет команду в контейнере amnezia-awg и возвращает (rc, stdout, stderr).
+    """
+    full = f"docker exec {AWG_CONTAINER} sh -lc {repr(cmd)}"
+    rc, out, err = run_cmd(full)
+    return rc, (out or ""), (err or "")
 
-def add_user(tg_id: int, name: str) -> Dict[str, str]:
-    if not AWG_CONNECT_HOST:
-        raise RuntimeError("Не задан AWG_CONNECT_HOST.")
-    listen_port = _server_listen_port()
-    server_pub = _server_pubkey()
-    assigned_ip = _next_ip()
 
-    bin_ = get_awg_bin()
-    priv = docker_exec(AWG_CONTAINER, "sh", "-lc", f"{bin_} genkey").strip()
-    pub  = docker_exec(AWG_CONTAINER, "sh", "-lc", f"printf %s {shq(priv)} | {bin_} pubkey").strip()
-    psk  = docker_exec(AWG_CONTAINER, "sh", "-lc", f"{bin_} genpsk || true").strip()
+def _require_ok(cmd: str, timeout: int = 8) -> str:
+    rc, out, err = _sh(cmd, timeout=timeout)
+    if rc != 0:
+        raise RuntimeError(f"cmd failed: {cmd}\nrc={rc}\n{err}")
+    return out
 
-    # применяем live
-    docker_exec(
-        AWG_CONTAINER, "sh","-lc",
-        f'TMP="/tmp/psk-$$.key"; printf %s {shq(psk)} > "$TMP"; '
-        f'{bin_} set wg0 peer {shq(pub)} preshared-key "$TMP" allowed-ips {shq(assigned_ip)}; rm -f "$TMP"'
-    )
-    # фиксируем в wg0.conf
-    docker_exec(
-        AWG_CONTAINER, "sh", "-lc",
-        f'TS=$(date +%Y%m%d-%H%M%S); cp -f {shq(AWG_CONFIG_PATH)} {shq(AWG_CONFIG_PATH)}.bak-$TS; '
-        f'{{ echo; echo "[Peer]"; echo "PublicKey = {pub}"; echo "PresharedKey = {psk}"; echo "AllowedIPs = {assigned_ip}"; }} >> {shq(AWG_CONFIG_PATH)}'
-    )
 
-    # clientsTable
-    email = _email(tg_id, name)
-    docker_exec(
-        AWG_CONTAINER, "sh","-lc",
-        "CT=/opt/amnezia/awg/clientsTable; TS=$(date +%Y%m%d-%H%M%S); cp -f \"$CT\" \"$CT.bak-$TS\" || true; "
-        f'PUB={shq(pub)}; IP={shq(assigned_ip)}; EMAIL={shq(email)}; DATE="$(date -u)"; '
-        'if grep -q \\"clientId\\" "$CT" 2>/dev/null; then '
-        '  TMP="$(mktemp)"; sed \'$d\' "$CT" > "$TMP"; echo "," >> "$TMP"; '
-        '  cat >> "$TMP" <<EOF\n{\n  "clientId": "'"$PUB"'",\n  "userData": {\n    "allowedIps": "'"$IP"'",\n    "clientName": "'"$EMAIL"'",\n    "creationDate": "'"$DATE"'" \n  }\n}\nEOF\n'
-        '  echo "]" >> "$TMP"; mv "$TMP" "$CT"; '
-        'else '
-        '  cat > "$CT" <<EOF\n[\n{\n  "clientId": "'"$PUB"'",\n  "userData": {\n    "allowedIps": "'"$IP"'",\n    "clientName": "'"$EMAIL"'",\n    "creationDate": "'"$DATE"'" \n  }\n}\n]\nEOF\n'
-        "fi"
-    )
+# ==== парсинг / состояние сервера ====
 
-    endpoint = f"{AWG_CONNECT_HOST}:{listen_port}"
 
-    # собираем легальный для Amnezia wrapper (vpn://) с last_config
-    client_last_json = {
-        "interface":{"privateKey": priv, "address": assigned_ip.split("/")[0], "dns":["1.1.1.1","1.0.0.1"]},
-        "peer":{"publicKey": server_pub, "presharedKey": psk, "endpoint": endpoint,
-                "allowedIPs":["0.0.0.0/0","::/0"], "persistentKeepalive":25},
-    }
-    wrapper = {
-        "containers":[{"container":"amnezia-awg","amnezia_wg":{
-            "last_config": client_last_json, "port": str(listen_port), "transport_proto":"udp"}}],
-        "defaultContainer":"amnezia-awg","description":name,"dns1":"1.1.1.1","dns2":"1.0.0.1",
-        "hostName":AWG_CONNECT_HOST,"nameOverriddenByUser":True
-    }
-    wjson = json.dumps(wrapper, ensure_ascii=False, separators=(",",":"))
-    vpn_url = "vpn://" + _b64url(b"\x00\x00\x07\x43" + zlib.compress(wjson.encode("utf-8"),9))
-
-    return {
-        "email": _email(tg_id, name),
-        "public_key": pub, "private_key": priv, "psk": psk,
-        "assigned_ip": assigned_ip, "endpoint": endpoint, "vpn_url": vpn_url,
-        "port": str(listen_port), "server_pub": server_pub or ""
-    }
-
-def _read_clients_table() -> List[Dict[str, Any]]:
-    try:
-        raw = docker_read_file(AWG_CONTAINER, "/opt/amnezia/awg/clientsTable")
-        data = json.loads(raw)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-def _write_clients_table(lst: List[Dict[str, Any]]):
-    docker_write_file_atomic(
-        AWG_CONTAINER, "/opt/amnezia/awg/clientsTable",
-        json.dumps(lst, ensure_ascii=False, indent=4)
-    )
-
-def _remove_peer_live(pub: str):
-    bin_ = get_awg_bin()
-    docker_exec(AWG_CONTAINER, "sh", "-lc",
-                f'{bin_} set wg0 peer {shq(pub)} remove 2>/dev/null || true')
-
-def remove_user_by_name(tg_id: int, name: str) -> bool:
-    email = _email(tg_id, name)
-    entries = _read_clients_table()
-    idx, pub, ip = -1, None, None
-    for i, it in enumerate(entries):
-        try:
-            cid = (it.get("clientId") or "").strip()
-            ud  = it.get("userData") or {}
-            cname = (ud.get("clientName") or "").strip()
-            allowed = (ud.get("allowedIps") or "").strip()
-            if cname == email:
-                idx, pub, ip = i, (cid or None), (allowed or None)
-                break
-        except Exception:
+def _wg_dump() -> List[List[str]]:
+    """
+    wg show wg0 dump → список строк, разбитых по табам.
+    Формат:
+      [0] interface|peer
+      [1] pubkey
+      [2] priv_or_psk
+      [3] listen_port | endpoint
+      [4] fwmark | allowed_ips
+      ...
+    Возвращаем только строки с peer (а также первую interface-строку отдельно).
+    """
+    out = _require_ok(f"wg show {WG_IFACE} dump || wg show all dump || true")
+    rows = []
+    for line in (out or "").splitlines():
+        parts = line.strip().split("\t")
+        if not parts or parts[0] != WG_IFACE:
             continue
+        rows.append(parts)
+    return rows
 
-    removed = False
-    if idx >= 0:
-        if pub: _remove_peer_live(pub); removed = True
-        # чистим wg0.conf блоки по pub/ip (busybox-совместимый awk)
-        try:
-            script = (
-                "awk -v PUB=" + shq(pub or "") + " -v IP=" + shq(ip or "") +
-                r" 'function flush(){ if (!del) { for(i=1;i<=n;i++){ print buf[i] } } n=0; del=0 }"
-                r" BEGIN{ n=0; del=0 }"
-                r" /^\[Peer\]/{ flush() }"
-                r" { line=$0; buf[++n]=line;"
-                r"   if (PUB != \"\" && line ~ /PublicKey[[:space:]]*=[[:space:]]*/) { if (index(line, PUB)) del=1 }"
-                r"   if (IP  != \"\" && line ~ /AllowedIPs[[:space:]]*=[[:space:]]*/) { if (index(line, IP))  del=1 }"
-                r" }"
-                r" END{ flush() }'"
-                " " + shq(AWG_CONFIG_PATH) + " > " + shq(AWG_CONFIG_PATH) + ".new && mv " +
-                shq(AWG_CONFIG_PATH) + ".new " + shq(AWG_CONFIG_PATH)
-            )
-            docker_exec(AWG_CONTAINER, "sh", "-lc", script)
-        except Exception:
-            pass
-        new_entries = entries[:idx] + entries[idx+1:]
-        _write_clients_table(new_entries)
-        return True
 
-    return removed
-
-def find_user(tg_id: int, name: str) -> Optional[Dict[str, str]]:
-    if not AWG_CONNECT_HOST:
-        raise RuntimeError("Не задан AWG_CONNECT_HOST.")
-    listen_port = _server_listen_port()
-    server_pub = _server_pubkey()
-    email = _email(tg_id, name)
-
-    client_pub = ""
+def _listen_port_from_dump(rows: List[List[str]]) -> Optional[int]:
+    # Первая строка (interface) имеет listen_port в колонке [3]
+    # У тебя в выводе первая строка имеет много чисел – это нормально для разных версий wg.
+    # Поэтому берём ПЕРВУЮ строку и пытаемся распарсить [3] как порт.
+    if not rows:
+        return None
     try:
-        for it in _read_clients_table():
-            cid = (it.get("clientId") or "")
-            ud = it.get("userData") or {}
-            if (ud.get("clientName") or "") == email:
-                client_pub = cid.strip(); break
+        return int(rows[0][3])
     except Exception:
-        pass
-    if not client_pub:
         return None
 
+
+def _server_subnet() -> ipaddress.IPv4Network:
+    """
+    Определяем подсеть wg0. В твоём окружении wg0 имеет 10.8.1.0/24.
+    Берём из ip addr (надёжнее, чем читать конфиг).
+    """
+    out = _require_ok("ip -brief addr || ip a || true")
+    cidr = None
+    for line in out.splitlines():
+        if line.startswith(WG_IFACE) and "/" in line:
+            # пример: "wg0  UNKNOWN  10.8.1.0/24 ..."
+            toks = line.split()
+            for tok in toks:
+                if "/" in tok and tok.count(".") == 3:
+                    cidr = tok
+                    break
+    if not cidr:
+        # запасной путь — прочитать Address из wg0.conf
+        cfg = _require_ok(f"cat {CONF_PATH}")
+        for line in cfg.splitlines():
+            s = line.strip()
+            if s.lower().startswith("address"):
+                # Address = 10.8.1.0/24
+                _, val = s.split("=", 1)
+                cidr = val.strip()
+                break
+    if not cidr:
+        raise RuntimeError("Cannot detect WG subnet for wg0")
+    return ipaddress.ip_network(cidr, strict=False)
+
+
+def _used_client_ips(rows: List[List[str]]) -> List[ipaddress.IPv4Address]:
+    """
+    Собираем все занятые /32 из колонки allowed_ips по peers.
+    """
+    used: List[ipaddress.IPv4Address] = []
+    # Первая строка — интерфейс, вторая в твоём выводе — серверная /32 (10.8.1.1/32).
+    for parts in rows[1:]:
+        if len(parts) < 5:
+            continue
+        allowed = parts[4].strip()  # e.g. "10.8.1.23/32"
+        if not allowed or "/" not in allowed:
+            continue
+        try:
+            ip = ipaddress.ip_interface(allowed).ip
+            used.append(ip)  # только IPv4
+        except Exception:
+            pass
+    return used
+
+
+def _alloc_free_ip(
+    subnet: ipaddress.IPv4Network, used: List[ipaddress.IPv4Address]
+) -> ipaddress.IPv4Address:
+    """
+    Ищем свободный IP в подсети, пропуская network (.0) и, как правило, .1 (сервер).
+    Начинаем с .2.
+    """
+    used_set = set(used)
+    # Пройдём все хосты подсети начиная со .2
+    hosts = list(subnet.hosts())
+    for ip in hosts:
+        if ip.packed[-1] < 2:  # .0 или .1
+            continue
+        if ip in used_set:
+            continue
+        return ip
+    raise RuntimeError("No free IPs left in WG subnet")
+
+
+def _server_public_key() -> str:
+    return _require_ok(f"cat {SERVER_PUB_PATH}").strip()
+
+
+def _psk_path() -> str:
+    # общий PSK, как у тебя в контейнере
+    return PSK_PATH
+
+
+def _gen_client_keypair() -> Tuple[str, str]:
+    """
+    Генерируем приватный/публичный ключ клиента в контейнере.
+    """
+    priv = _require_ok("wg genkey")
+    pub = _require_ok(f"printf %s {priv} | wg pubkey")
+    return priv.strip(), pub.strip()
+
+
+def _wg_add_peer(pubkey: str, client_ip: str) -> None:
+    """
+    Добавляем peer в running-config wg0 с allowed-ips и preshared-key.
+    """
+    psk_path = _psk_path()
+    _require_ok(
+        f"wg set {WG_IFACE} peer {pubkey} preshared-key {psk_path} allowed-ips {client_ip}/32 persistent-keepalive 25"
+    )
+    # persist в конфиг
+    _require_ok(f"wg-quick save {WG_IFACE}")
+
+
+def _wg_remove_peer_by_pubkey(pubkey: str) -> bool:
+    rc, _, _ = _sh(
+        f"wg set {WG_IFACE} peer {pubkey} remove && wg-quick save {WG_IFACE}"
+    )
+    return rc == 0
+
+
+# ==== публичный API (используется bot.py) ====
+
+
+def list_all() -> List[Dict[str, Any]]:
+    """
+    Возвращает список всех peer'ов (по живой конфигурации wg0).
+    Поля: pubkey, allowed_ips, endpoint, latest_handshake, transfer_rx, transfer_tx.
+    """
+    rows = _wg_dump()
+    out: List[Dict[str, Any]] = []
+    # peers начинаются с индекса 1 (0 — интерфейс), но на некоторых системах 2-я строка может быть "server /32".
+    for parts in rows[1:]:
+        if len(parts) < 5:
+            continue
+        d: Dict[str, Any] = {
+            "pubkey": parts[1],
+            "preshared_key": parts[2],
+            "endpoint": parts[3],
+            "allowed_ips": parts[4],
+        }
+        # хвостовые метрики зависят от версии wg
+        if len(parts) >= 9:
+            d["latest_handshake"] = parts[5]
+            d["transfer_rx"] = parts[6]
+            d["transfer_tx"] = parts[7]
+        out.append(d)
+    return out
+
+
+def find_user(tid: int, name: str) -> Optional[Dict[str, Any]]:
+    """
+    Находит peer по (tid,name) через assigned_ip из state.json.
+    Возвращает словарь с endpoint/port/ip/pubkey, если найден.
+    """
+    st = load_state()
+    u = st.get("users", {}).get(str(tid), {})
+    pr = next(
+        (
+            p
+            for p in u.get("profiles", [])
+            if not p.get("deleted")
+            and p.get("type") in ("amneziawg", "awg")
+            and p.get("name") == name
+        ),
+        None,
+    )
+    if not pr:
+        return None
+    ip = (pr.get("assigned_ip") or "").split("/")[0]
+    if not ip:
+        return None
+    rows = _wg_dump()
+    # port с интерфейса
+    port = _listen_port_from_dump(rows) or 0
+    # найти peer по allowed_ips
+    for parts in rows[1:]:
+        if len(parts) < 5:
+            continue
+        allowed = parts[4]
+        if allowed.startswith(f"{ip}/"):
+            endpoint = parts[3]  # как правило "(none)" для клиента за NAT
+            return {
+                "pubkey": parts[1],
+                "allowed_ip": allowed,
+                "endpoint": endpoint,
+                "port": str(port),
+            }
+    return None
+
+
+def remove_user_by_name(tid: int, name: str) -> bool:
+    """
+    Удаляет peer, соответствующий (tid,name), используя assigned_ip из state.json.
+    """
+    st = load_state()
+    u = st.get("users", {}).get(str(tid), {})
+    pr = next(
+        (
+            p
+            for p in u.get("profiles", [])
+            if not p.get("deleted")
+            and p.get("type") in ("amneziawg", "awg")
+            and p.get("name") == name
+        ),
+        None,
+    )
+    if not pr:
+        return False
+    ip = (pr.get("assigned_ip") or "").split("/")[0]
+    if not ip:
+        return False
+    rows = _wg_dump()
+    for parts in rows[1:]:
+        if len(parts) < 5:
+            continue
+        allowed = parts[4]
+        if allowed.startswith(f"{ip}/"):
+            pub = parts[1]
+            return _wg_remove_peer_by_pubkey(pub)
+    return False
+
+
+def add_user(tid: int, name: str) -> Dict[str, Any]:
+    """
+    Создаёт нового клиента:
+      - генерирует ключи клиента
+      - выделяет свободный /32
+      - добавляет peer в wg0 (allowed-ips, preshared-key, keepalive)
+      - сохраняет в конфиг через wg-quick save
+      - возвращает данные для state.json и отображения в боте
+
+    Возвращаемое:
+    {
+      "email": f"{tid}.{name}@bot",
+      "vpn_url": "<WG config text for now>",  # временно: текст WireGuard-конфига
+      "endpoint": "<host:port>",              # внешний endpoint
+      "assigned_ip": "10.8.1.X/32"
+    }
+    """
+    rows = _wg_dump()
+    subnet = _server_subnet()
+    used = _used_client_ips(rows)
+    client_ip = _alloc_free_ip(subnet, used)
+    client_ip_cidr = f"{client_ip}/32"
+
+    # порт слушателя сервера
+    port = _listen_port_from_dump(rows)
+    if not port:
+        # запасной путь: прочесть из конфига
+        cfg = _require_ok(f"cat {CONF_PATH}")
+        port = 33925
+        for line in cfg.splitlines():
+            s = line.strip()
+            if s.lower().startswith("listenport"):
+                _, val = s.split("=", 1)
+                try:
+                    port = int(val.strip())
+                except Exception:
+                    pass
+                break
+
+    # ключи и добавление
+    cli_priv, cli_pub = _gen_client_keypair()
+    _wg_add_peer(cli_pub, str(client_ip))
+
+    # серверный публичный ключ и общий PSK
+    srv_pub = _server_public_key()
+    psk = _require_ok(f"cat {PSK_PATH}").strip()
+
+    # внешний endpoint (хост берём из util.AWG_CONNECT_HOST, порт — listen_port)
+    endpoint = f"{AWG_CONNECT_HOST}:{port}"
+
+    # Сформируем клиентский .conf (на данный момент это и будет "vpn_url" для вывода)
+    wg_conf = (
+        "[Interface]\n"
+        f"PrivateKey = {cli_priv}\n"
+        f"Address = {client_ip_cidr}\n"
+        "DNS = 1.1.1.1\n"
+        "\n"
+        "[Peer]\n"
+        f"PublicKey = {srv_pub}\n"
+        f"PresharedKey = {psk}\n"
+        f"Endpoint = {endpoint}\n"
+        "AllowedIPs = 0.0.0.0/0, ::/0\n"
+        "PersistentKeepalive = 25\n"
+    )
+
     return {
-        "email": email,
-        "public_key": client_pub,
-        "endpoint": f"{AWG_CONNECT_HOST}:{listen_port}",
-        "server_pub": server_pub,
-        "port": str(listen_port),
+        "email": f"{tid}.{name}@bot",
+        "vpn_url": wg_conf,  # временно: текст WG-конфига (заменим на vpn:// позже)
+        "endpoint": endpoint,
+        "assigned_ip": client_ip_cidr,
+        # опционально можно вернуть и pubkey, если решим сохранять его в state:
+        "pubkey": cli_pub,
     }
