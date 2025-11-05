@@ -408,3 +408,43 @@ def universal_uri_diagnostic() -> Dict[str, Any]:
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ========================= точечный апдейт клиента по email =========================
+
+def ensure_user_uuid_flow(tg_id: int, name: str, uuid_val: str, flow_val: Optional[str] = None) -> bool:
+    """
+    Обновляет существующего клиента (uuid/flow) по email=<tgid>-<name>.
+    Если клиента нет — добавляет.
+    Возвращает True, если изменения применены успешно.
+    """
+    try:
+        email = _email(tg_id, name)
+        cfg = _load_cfg()
+        ib = _get_inbound(cfg)
+        clients = ib.setdefault("settings", {}).setdefault("clients", [])
+        idx, cli = _find_client(ib, email)
+
+        if idx >= 0 and cli:
+            changed = False
+            if cli.get("id") != uuid_val:
+                cli["id"] = uuid_val
+                changed = True
+            if flow_val and cli.get("flow") != flow_val:
+                cli["flow"] = flow_val
+                changed = True
+            if changed:
+                _save_cfg(cfg)
+                docker_restart(XRAY_CONTAINER)
+            return True
+
+        # не найден — добавляем новый
+        flow_to_use = flow_val or _flow(ib) or "xtls-rprx-vision"
+        clients.append({"id": uuid_val, "flow": flow_to_use, "email": email})
+        _save_cfg(cfg)
+        docker_restart(XRAY_CONTAINER)
+        return True
+    except Exception as e:
+        import logging
+        logging.getLogger("awgbot").warning({"event": "xray_ensure_user_uuid_flow_fail", "err": str(e)})
+        return False
