@@ -166,15 +166,54 @@ def _wg_add_peer(pubkey: str, client_ip: str) -> None:
     _require_ok(
         f"wg set {WG_IFACE} peer {pubkey} preshared-key {psk_path} allowed-ips {client_ip}/32 persistent-keepalive 25"
     )
-    # persist в конфиг
-    _require_ok(f"wg-quick save {WG_IFACE}")
+    # Persist running config:
+    # 1) If /etc/wireguard/wg0.conf exists → use wg-quick save
+    # 2) Else append a [Peer] block into /opt/amnezia/awg/wg0.conf
+    rc, _, _ = _sh(f"test -f /etc/wireguard/{WG_IFACE}.conf")
+    if rc == 0:
+        _require_ok(f"wg-quick save {WG_IFACE}")
+    else:
+        psk_val = _require_ok(f"cat {PSK_PATH}").strip()
+        _require_ok(
+            "cat >> {conf} << 'EOF'\n[Peer]\nPublicKey = {pub}\nPresharedKey = {psk}\nAllowedIPs = {ip}/32\nPersistentKeepalive = 25\nEOF".format(
+                conf=CONF_PATH, pub=pubkey, psk=psk_val, ip=client_ip
+            )
+        )
 
 
 def _wg_remove_peer_by_pubkey(pubkey: str) -> bool:
-    rc, _, _ = _sh(
-        f"wg set {WG_IFACE} peer {pubkey} remove && wg-quick save {WG_IFACE}"
-    )
-    return rc == 0
+    # Remove from running config
+    rc, _, _ = _sh(f"wg set {WG_IFACE} peer {pubkey} remove")
+    ok_run = (rc == 0)
+    # Persist:
+    rc_etc, _, _ = _sh(f"test -f /etc/wireguard/{WG_IFACE}.conf")
+    if rc_etc == 0:
+        # native persistence
+        _sh(f"wg-quick save {WG_IFACE}")
+        return ok_run
+    # else: edit /opt/amnezia/awg/wg0.conf and drop the peer block by its PublicKey
+    awk_prog = (
+        'awk -v pk="{pk}" \''
+        'BEGIN{{inpeer=0; keep=1; buf=""}}'
+        '/^\\[Peer\\]$/{{'
+        '  if(inpeer){{ if(keep){{printf "%s", buf}} buf=""; }}'
+        '  inpeer=1; keep=1; buf=$0 ORS; next'
+        '}}'
+        '{{'
+        '  if(inpeer){{'
+        '    buf=buf $0 ORS;'
+        '    if($0 ~ /^PublicKey[ ]*=/){{'
+        '      key=$0; sub(/^PublicKey[ ]*=[ ]*/, "", key);'
+        '      if(key==pk) keep=0;'
+        '    }}'
+        '    next'
+        '  }}'
+        '  print'
+        '}}'
+        'END{{ if(inpeer){{ if(keep) printf "%s", buf }} }}\' {conf} > {conf}.tmp && mv {conf}.tmp {conf}'
+    ).format(pk=pubkey, conf=CONF_PATH)
+    rc2, _, _ = _sh(awk_prog)
+    return ok_run and (rc2 == 0)
 
 
 # ==== публичный API (используется bot.py) ====
