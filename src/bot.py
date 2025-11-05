@@ -52,6 +52,8 @@ ERROR_NOTIFY_COOLDOWN_SEC = int(os.getenv("ERROR_NOTIFY_COOLDOWN_SEC", "600"))
 from logger_setup import get_logger
 
 logger = get_logger()
+_last_state_backup_ts: float = 0.0
+_last_state_backup_fingerprint: str = ""
 
 
 def ensure_rid(context) -> str:
@@ -480,6 +482,7 @@ HEARTBEAT_PATH = os.path.join(DATA_DIR, "heartbeat")
 # === Автобэкапы state.json ===
 STATE_BACKUPS_DIR = os.getenv("STATE_BACKUPS_DIR", "/app/data/backups")
 STATE_BACKUPS_KEEP = int(os.getenv("STATE_BACKUPS_KEEP", "20"))
+STATE_BACKUP_MIN_INTERVAL_SEC = int(os.getenv("STATE_BACKUP_MIN_INTERVAL_SEC", "30"))
 
 
 def _state_backup_timestamp() -> str:
@@ -568,17 +571,64 @@ def _make_state_backup() -> Path | None:
         return None
 
 
-def _auto_backup_state_json():
+def _auto_backup_state_json(state_obj: dict) -> None:
     """
-    Обёртка: делает бэкап и запускает ротацию. Никогда не бросает исключений.
+    Делает бэкап state.json, только если содержимое изменилось с прошлого сохранения
+    и соблюдён минимальный интервал между бэкапами.
     """
+    import hashlib, time, json, os
+
+    global _last_state_backup_ts, _last_state_backup_fingerprint
+
     try:
-        _make_state_backup()
-    finally:
+        # 1) нормализованный дамп (стабильная сортировка ключей)
+        dump = json.dumps(
+            state_obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        fp = hashlib.sha256(dump.encode("utf-8")).hexdigest()
+
+        # 2) если не изменилось — выходим
+        if fp == _last_state_backup_fingerprint:
+            return
+
+        # 3) античастота: не чаще чем раз в STATE_BACKUP_MIN_INTERVAL_SEC
+        now = time.time()
+        if (now - _last_state_backup_ts) < max(0, STATE_BACKUP_MIN_INTERVAL_SEC):
+            return
+
+        # 4) путь и каталог
+        bdir = STATE_BACKUPS_DIR
+        _ensure_dir(bdir)
+        ts = _state_backup_timestamp()
+        bpath = os.path.join(bdir, f"state-{ts}.json")
+
+        # 5) записываем снапшот
+        with open(bpath, "w", encoding="utf-8") as f:
+            f.write(dump)
+
+        logger.info({"event": "state_backup_ok", "path": bpath})
+
+        # 6) ротация (функция без параметров → просто вызываем)
+        total_before, removed = _rotate_state_backups()
         try:
-            _rotate_state_backups()
+            total_after = len(_list_state_backups())
         except Exception:
-            pass
+            total_after = total_before - removed
+        logger.info(
+            {
+                "event": "state_backup_rotate",
+                "total": total_after,
+                "keep": STATE_BACKUPS_KEEP,
+                "removed": removed,
+            }
+        )
+
+        # 7) фиксируем «последнее»
+        _last_state_backup_fingerprint = fp
+        _last_state_backup_ts = now
+
+    except Exception as e:
+        logger.warning({"event": "state_backup_postsave_fail", "error": str(e)})
 
 
 # ========= УТИЛИТЫ (только локальные, без docker) =========
@@ -632,7 +682,7 @@ def save_state(st: Dict[str, Any]):
     os.replace(tmp, STATE_PATH)
     # Автобэкап с ротацией (не мешает основному сохранению)
     try:
-        _auto_backup_state_json()
+        _auto_backup_state_json(st)
     except Exception:
         # бэкап не критичен — просто залогируем
         try:
