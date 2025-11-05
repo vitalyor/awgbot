@@ -472,9 +472,113 @@ logger.info(
 MAX_XRAY = int(os.environ.get("MAX_XRAY", "5"))
 MAX_AWG = int(os.environ.get("MAX_AWG", "5"))
 
+
 DATA_DIR = "/app/data"
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 HEARTBEAT_PATH = os.path.join(DATA_DIR, "heartbeat")
+
+# === Автобэкапы state.json ===
+STATE_BACKUPS_DIR = os.getenv("STATE_BACKUPS_DIR", "/app/data/backups")
+STATE_BACKUPS_KEEP = int(os.getenv("STATE_BACKUPS_KEEP", "20"))
+
+
+def _state_backup_timestamp() -> str:
+    # UTC timestamp for filenames
+    return datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+
+
+def _ensure_dir(path: str) -> None:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _list_state_backups() -> list[Path]:
+    try:
+        p = Path(STATE_BACKUPS_DIR)
+        if not p.exists():
+            return []
+        items = [x for x in p.glob("state-*.json") if x.is_file()]
+        # newest first
+        items.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        return items
+    except Exception:
+        return []
+
+
+def _rotate_state_backups() -> tuple[int, int]:
+    """
+    Оставляет только STATE_BACKUPS_KEEP последних бэкапов.
+    Возвращает (total_before, removed).
+    """
+    items = _list_state_backups()
+    total = len(items)
+    removed = 0
+    try:
+        if total > STATE_BACKUPS_KEEP:
+            for x in items[STATE_BACKUPS_KEEP:]:
+                try:
+                    x.unlink(missing_ok=True)
+                    removed += 1
+                except Exception:
+                    pass
+    finally:
+        try:
+            logger.info(
+                {
+                    "event": "state_backup_rotate",
+                    "total": total,
+                    "keep": STATE_BACKUPS_KEEP,
+                    "removed": removed,
+                }
+            )
+        except Exception:
+            pass
+    return total, removed
+
+
+def _make_state_backup() -> Path | None:
+    """
+    Создаёт бэкап текущего state.json в каталоге STATE_BACKUPS_DIR под именем:
+    state-YYYYmmdd-HHMMSS.json
+    Возвращает путь к созданному файлу или None при ошибке.
+    """
+    try:
+        if not os.path.exists(STATE_PATH):
+            return None
+        _ensure_dir(STATE_BACKUPS_DIR)
+        ts = _state_backup_timestamp()
+        dst = Path(STATE_BACKUPS_DIR) / f"state-{ts}.json"
+        # копируем атомарно через tmp
+        tmp = str(dst) + ".tmp"
+        with open(STATE_PATH, "rb") as src, open(tmp, "wb") as out:
+            out.write(src.read())
+        os.replace(tmp, dst)
+        try:
+            logger.info({"event": "state_backup_ok", "path": str(dst)})
+        except Exception:
+            pass
+        return dst
+    except Exception as e:
+        try:
+            logger.warning({"event": "state_backup_fail", "error": str(e)})
+        except Exception:
+            pass
+        return None
+
+
+def _auto_backup_state_json():
+    """
+    Обёртка: делает бэкап и запускает ротацию. Никогда не бросает исключений.
+    """
+    try:
+        _make_state_backup()
+    finally:
+        try:
+            _rotate_state_backups()
+        except Exception:
+            pass
 
 
 # ========= УТИЛИТЫ (только локальные, без docker) =========
@@ -526,6 +630,15 @@ def save_state(st: Dict[str, Any]):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(st, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_PATH)
+    # Автобэкап с ротацией (не мешает основному сохранению)
+    try:
+        _auto_backup_state_json()
+    except Exception:
+        # бэкап не критичен — просто залогируем
+        try:
+            logger.warning({"event": "state_backup_postsave_fail"})
+        except Exception:
+            pass
 
 
 def load_state() -> Dict[str, Any]:
