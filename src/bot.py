@@ -1204,7 +1204,7 @@ def sync_render(data: dict, flt: str, mode: str) -> list[str]:
 
     elif flt == "absent":
         lines.append("<b>Отсутствуют в Xray (есть в БД):</b>\n" + fmt_pairs(only_in_state))
-    elif flt == "stale":
+    elif flt == "extra":
         lines.append("<b>Есть в Xray (свои), отсутствуют в БД:</b>\n" + fmt_pairs(only_in_xray))
     elif flt == "diverged":
         lines.append("<b>Расхождения:</b>\n" + (fmt_pairs(diverged) if diverged else "—"))
