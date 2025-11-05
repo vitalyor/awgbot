@@ -129,6 +129,35 @@ async def show_admin_user_profiles(
             left = f"{name} · {ptype}"
         rows.append([InlineKeyboardButton(left, callback_data=f"admin_prof_open:{tid}:{name}:{ptype}")])
 
+    # --- массовые действия по Xray (если есть такие профили) ---
+    xray_profiles = [p for p in act if p.get("type") == "xray"]
+    if xray_profiles:
+        # посчитаем статусы для подсказки и чтобы решать, какие кнопки показывать
+        cnt_active = 0
+        cnt_susp = 0
+        for p in xray_profiles:
+            status, _ = _xray_status_for_user(urec, int(tid), p.get("name", ""))
+            if status == "active":
+                cnt_active += 1
+            elif status == "suspended":
+                cnt_susp += 1
+        mass_row = []
+        if cnt_active > 0:
+            mass_row.append(
+                InlineKeyboardButton(
+                    "⏸ Приостановить все Xray",
+                    callback_data=f"admin_user_suspend_all_xray:{tid}",
+                )
+            )
+        if cnt_susp > 0:
+            mass_row.append(
+                InlineKeyboardButton(
+                    "▶️ Возобновить все Xray",
+                    callback_data=f"admin_user_resume_all_xray:{tid}",
+                )
+            )
+        if mass_row:
+            rows.append(mass_row)
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_user_open:{tid}")])
     kb = InlineKeyboardMarkup(rows)
     txt = f"Конфигурации пользователя <code>{tid}</code>" + (f"\n\n{note}" if note else "")

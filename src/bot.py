@@ -446,8 +446,6 @@ async def _sync_report_send_or_edit(update, context, flt: str, mode: str):
             context.user_data["last_bot_msg_id"] = msg.message_id
 
 
-
-
 def _sync_collect_probe() -> dict:
     """
     Собирает диагностику рассинхрона Xray ↔ state.json (read-only).
@@ -2338,8 +2336,6 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"\n⏸ Ваши Xray-профили приостановлены ({done} из {total})." if total else ""
     )
     _notify_user_simple(context, tid, note_user)
-
-
 
 
 @autoclean_command_input
