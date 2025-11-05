@@ -1929,6 +1929,8 @@ def build_sync_kb(active_filter: str, mode: str) -> InlineKeyboardMarkup:
         ],
     ]
     return InlineKeyboardMarkup(rows)
+
+
 def _find_xray_bot_client(tid: int, name: str) -> dict | None:
     """Ищет 'своего' клиента Xray по (tid,name). Возвращает словарь клиента или None."""
     try:
@@ -1951,12 +1953,24 @@ def sync_diverged_update_db_one(tid: int, name: str) -> tuple[bool, str]:
     st = load_state()
     urec, pr = _get_state_profile(st, tid, name)
     if not urec or not pr:
-        _log_apply("sync_diverged_update_db_one", tid=tid, name=name, ok=False, reason="profile_not_in_state")
+        _log_apply(
+            "sync_diverged_update_db_one",
+            tid=tid,
+            name=name,
+            ok=False,
+            reason="profile_not_in_state",
+        )
         return False, "profile_not_in_state"
 
     xr = _find_xray_bot_client(tid, name)
     if not xr:
-        _log_apply("sync_diverged_update_db_one", tid=tid, name=name, ok=False, reason="not_found_in_xray")
+        _log_apply(
+            "sync_diverged_update_db_one",
+            tid=tid,
+            name=name,
+            ok=False,
+            reason="not_found_in_xray",
+        )
         return False, "not_found_in_xray"
 
     # применяем uuid/flow из Xray
@@ -1967,7 +1981,14 @@ def sync_diverged_update_db_one(tid: int, name: str) -> tuple[bool, str]:
     pr["last_xray_sync_at"] = now_iso()
     save_state(st)
 
-    _log_apply("sync_diverged_update_db_one", tid=tid, name=name, ok=True, reason="ok", uuid=pr.get("uuid"))
+    _log_apply(
+        "sync_diverged_update_db_one",
+        tid=tid,
+        name=name,
+        ok=True,
+        reason="ok",
+        uuid=pr.get("uuid"),
+    )
     return True, "ok"
 
 
@@ -1979,22 +2000,46 @@ def sync_diverged_rebuild_xray_one(tid: int, name: str) -> tuple[bool, str]:
     st = load_state()
     urec, pr = _get_state_profile(st, tid, name)
     if not urec or not pr:
-        _log_apply("sync_diverged_rebuild_xray_one", tid=tid, name=name, ok=False, reason="profile_not_in_state")
+        _log_apply(
+            "sync_diverged_rebuild_xray_one",
+            tid=tid,
+            name=name,
+            ok=False,
+            reason="profile_not_in_state",
+        )
         return False, "profile_not_in_state"
 
     if not urec.get("allowed", False):
-        _log_apply("sync_diverged_rebuild_xray_one", tid=tid, name=name, ok=False, reason="user_disallowed")
+        _log_apply(
+            "sync_diverged_rebuild_xray_one",
+            tid=tid,
+            name=name,
+            ok=False,
+            reason="user_disallowed",
+        )
         return False, "user_disallowed"
 
     if pr.get("suspended"):
-        _log_apply("sync_diverged_rebuild_xray_one", tid=tid, name=name, ok=False, reason="profile_suspended")
+        _log_apply(
+            "sync_diverged_rebuild_xray_one",
+            tid=tid,
+            name=name,
+            ok=False,
+            reason="profile_suspended",
+        )
         return False, "profile_suspended"
 
     want_uuid = (pr.get("uuid") or "").strip()
     want_flow = (pr.get("flow") or "").strip() or None
 
     if not want_uuid:
-        _log_apply("sync_diverged_rebuild_xray_one", tid=tid, name=name, ok=False, reason="no_uuid_in_state")
+        _log_apply(
+            "sync_diverged_rebuild_xray_one",
+            tid=tid,
+            name=name,
+            ok=False,
+            reason="no_uuid_in_state",
+        )
         return False, "no_uuid_in_state"
 
     try:
@@ -2006,15 +2051,35 @@ def sync_diverged_rebuild_xray_one(tid: int, name: str) -> tuple[bool, str]:
             XR.remove_user_by_name(tid, name)
             ok = bool(XR.resume_user_by_name(tid, name, want_uuid, want_flow))
         if not ok:
-            _log_apply("sync_diverged_rebuild_xray_one", tid=tid, name=name, ok=False, reason="xray_update_fail")
+            _log_apply(
+                "sync_diverged_rebuild_xray_one",
+                tid=tid,
+                name=name,
+                ok=False,
+                reason="xray_update_fail",
+            )
             return False, "xray_update_fail"
     except Exception as e:
-        _log_apply("sync_diverged_rebuild_xray_one", tid=tid, name=name, ok=False, reason="xray_update_exc", error=str(e))
+        _log_apply(
+            "sync_diverged_rebuild_xray_one",
+            tid=tid,
+            name=name,
+            ok=False,
+            reason="xray_update_exc",
+            error=str(e),
+        )
         return False, "xray_update_exc"
 
     pr["last_xray_sync_at"] = now_iso()
     save_state(st)
-    _log_apply("sync_diverged_rebuild_xray_one", tid=tid, name=name, ok=True, reason="ok", uuid=pr.get("uuid"))
+    _log_apply(
+        "sync_diverged_rebuild_xray_one",
+        tid=tid,
+        name=name,
+        ok=True,
+        reason="ok",
+        uuid=pr.get("uuid"),
+    )
     return True, "ok"
 
 
@@ -2041,7 +2106,13 @@ def sync_diverged_update_db_all() -> dict:
                 skipped += 1
             else:
                 errors += 1
-    summary = {"total": total, "done": done, "skipped": skipped, "errors": errors, "items": results}
+    summary = {
+        "total": total,
+        "done": done,
+        "skipped": skipped,
+        "errors": errors,
+        "items": results,
+    }
     _log_apply("sync_diverged_update_db_all", **summary)
     return summary
 
@@ -2064,11 +2135,22 @@ def sync_diverged_rebuild_xray_all() -> dict:
         if ok:
             done += 1
         else:
-            if reason in ("user_disallowed", "profile_suspended", "profile_not_in_state", "no_uuid_in_state"):
+            if reason in (
+                "user_disallowed",
+                "profile_suspended",
+                "profile_not_in_state",
+                "no_uuid_in_state",
+            ):
                 skipped += 1
             else:
                 errors += 1
-    summary = {"total": total, "done": done, "skipped": skipped, "errors": errors, "items": results}
+    summary = {
+        "total": total,
+        "done": done,
+        "skipped": skipped,
+        "errors": errors,
+        "items": results,
+    }
     _log_apply("sync_diverged_rebuild_xray_all", **summary)
     return summary
 
@@ -3617,6 +3699,59 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _sync_report_send_or_edit(update, context, flt, mode)
         return
 
+    if data == "sync_apply_diverged_db_all":
+        summary = sync_diverged_update_db_all()
+        txt = (
+            "🧭 <b>Обновление БД по Xray (diverged)</b>\n"
+            f"Всего: <b>{summary['total']}</b>\n"
+            f"Обновлено: <b>{summary['done']}</b>\n"
+            f"Пропущено: <b>{summary['skipped']}</b>\n"
+            f"Ошибок: <b>{summary['errors']}</b>\n"
+        )
+        await edit_or_send(
+            update,
+            context,
+            txt,
+            InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ Назад к отчёту", callback_data="sync_refresh"
+                        )
+                    ]
+                ]
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "sync_apply_diverged_xray_all":
+        summary = sync_diverged_rebuild_xray_all()
+        txt = (
+            "🔁 <b>Пересборка в Xray по БД (diverged)</b>\n"
+            f"Всего: <b>{summary['total']}</b>\n"
+            f"Изменено: <b>{summary['done']}</b>\n"
+            f"Пропущено: <b>{summary['skipped']}</b>\n"
+            f"Ошибок: <b>{summary['errors']}</b>\n"
+            "<i>Профили с suspended или у пользователей без доступа не менялись.</i>"
+        )
+        await edit_or_send(
+            update,
+            context,
+            txt,
+            InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "⬅️ Назад к отчёту", callback_data="sync_refresh"
+                        )
+                    ]
+                ]
+            ),
+            parse_mode="HTML",
+        )
+        return
+
     if data == "sync_apply_extra_all":
         # запускаем массовое удаление лишних (только source=bot)
         summary = sync_extra_apply_all()
@@ -4904,36 +5039,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-    if data == "sync_apply_diverged_db_all":
-        summary = sync_diverged_update_db_all()
-        txt = (
-            "🧭 <b>Обновление БД по Xray (diverged)</b>\n"
-            f"Всего: <b>{summary['total']}</b>\n"
-            f"Обновлено: <b>{summary['done']}</b>\n"
-            f"Пропущено: <b>{summary['skipped']}</b>\n"
-            f"Ошибок: <b>{summary['errors']}</b>\n"
-        )
-        await edit_or_send(
-            update, context, txt,
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад к отчёту", callback_data="sync_refresh")]]),
-            parse_mode="HTML"
-        )
-        return
-
-    if data == "sync_apply_diverged_xray_all":
-        summary = sync_diverged_rebuild_xray_all()
-        txt = (
-            "🔁 <b>Пересборка в Xray по БД (diverged)</b>\n"
-            f"Всего: <b>{summary['total']}</b>\n"
-            f"Изменено: <b>{summary['done']}</b>\n"
-            f"Пропущено: <b>{summary['skipped']}</b>\n"
-            f"Ошибок: <b>{summary['errors']}</b>\n"
-            "<i>Профили с suspended или у пользователей без доступа не менялись.</i>"
-        )
-        await edit_or_send(
-            update, context, txt,
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад к отчёту", callback_data="sync_refresh")]]),
-            parse_mode="HTML"
-        )
-        return
