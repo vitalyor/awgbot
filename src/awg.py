@@ -173,12 +173,19 @@ def _wg_add_peer(pubkey: str, client_ip: str) -> None:
     if rc == 0:
         _require_ok(f"wg-quick save {WG_IFACE}")
     else:
+        # Heredoc через sh -lc может ломаться из-за кавычек. Используем printf с ANSI C quoting ($'...').
         psk_val = _require_ok(f"cat {PSK_PATH}").strip()
-        _require_ok(
-            "cat >> {conf} << 'EOF'\n[Peer]\nPublicKey = {pub}\nPresharedKey = {psk}\nAllowedIPs = {ip}/32\nPersistentKeepalive = 25\nEOF".format(
-                conf=CONF_PATH, pub=pubkey, psk=psk_val, ip=client_ip
-            )
+        block = (
+            "[Peer]\n"
+            f"PublicKey = {pubkey}\n"
+            f"PresharedKey = {psk_val}\n"
+            f"AllowedIPs = {client_ip}/32\n"
+            "PersistentKeepalive = 25\n"
         )
+        # Экранируем переходы строк для $'...'
+        block_escaped = block.replace("\\", "\\\\").replace("\n", "\\n")
+        append_cmd = f"printf %s $'{block_escaped}' >> {CONF_PATH}"
+        _require_ok(append_cmd)
 
 
 def _wg_remove_peer_by_pubkey(pubkey: str) -> bool:
