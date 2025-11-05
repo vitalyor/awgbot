@@ -1,0 +1,118 @@
+# ==================== AMNEZIA VPN BOT — DOCKER COMPOSE ====================
+# Этот файл описывает продакшн-сборку бота и его зависимостей.
+# Все параметры окружения берутся из:
+#   - .env (общие, не секретные)
+#   - secret.env (чувствительные данные, монтируется как /run/secrets/secret.env)
+# ==========================================================================
+
+services:
+
+  # -------------------- Telegram Bot --------------------
+  awgbot:
+    container_name: awgbot
+    build:
+      context: /opt/awgbot
+      dockerfile: Dockerfile
+    restart: unless-stopped
+
+    # Рабочая директория внутри контейнера
+    working_dir: /app
+
+    # Подключаем наш общий сетевой слой (автоматически создаётся)
+    networks:
+      - default
+
+    # === Переменные окружения ===
+    env_file:
+      - .env
+    environment:
+      # Доступ к Docker через безопасный прокси (tecnativa/docker-socket-proxy)
+      DOCKER_HOST: tcp://docker-proxy:2375
+
+      DOCKER_PROXY_LOG_LEVEL: ${DOCKER_PROXY_LOG_LEVEL:-notice}
+      UMASK: ${UMASK:-027}
+      TZ: ${TZ:-Europe/Moscow}
+
+    # === Хранилище и секреты ===
+    volumes:
+      # Папка данных бота (state.json, heartbeat, временные файлы)
+      - type: bind
+        source: /opt/awgbot/data
+        target: /app/data
+        bind:
+          create_host_path: true
+
+      # Файл с чувствительными переменными (токен, admin IDs и пр.)
+      - type: bind
+        source: /opt/awgbot/secret.env
+        target: /run/secrets/secret.env
+        read_only: true
+        bind:
+          create_host_path: true
+
+    # === Ограничения безопасности ===
+    read_only: true # ФС в контейнере только для чтения (кроме volumes)
+    tmpfs:
+      - /tmp # Временные файлы только в памяти
+    security_opt:
+      - no-new-privileges:true # Контейнер не может повышать свои привилегии
+    mem_limit: 256m # Защита от переполнения памяти
+
+    # === Healthcheck ===
+    # Проверяет файл heartbeat (обновляется ботом)
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |-
+          python - <<'PY'
+          import os, time, sys
+          p='/app/data/heartbeat'
+          try:
+              m=os.path.getmtime(p)
+              sys.exit(0 if time.time()-m<60 else 1)
+          except Exception:
+              sys.exit(1)
+          PY
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    depends_on:
+      docker-proxy:
+        condition: service_started
+        required: true
+
+  # -------------------- Docker Socket Proxy --------------------
+  # Этот сервис безопасно проксирует Docker API и ограничивает доступ бота
+  # только к тем эндпоинтам, которые нужны (containers, exec, get, post).
+  docker-proxy:
+    container_name: docker-proxy
+    image: tecnativa/docker-socket-proxy:0.1.1
+    restart: unless-stopped
+
+    networks:
+      - default
+
+    environment:
+      # Разрешаем только нужные действия
+      CONTAINERS: 1
+      EXEC: 1
+      GET: 1
+      POST: 1
+
+      # Управление логированием (см. .env)
+      LOG_LEVEL: ${DOCKER_PROXY_LOG_LEVEL:-notice}
+
+    volumes:
+      # Сокет Docker демона (только для чтения)
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+
+# ==================== Networks ====================
+# Сеть создаётся автоматически, используется для общения бота и прокси.
+networks:
+  default:
+    name: awgbot_default

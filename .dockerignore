@@ -1,0 +1,6 @@
+data/
+secrets/
+*.pyc
+__pycache__/
+docker-compose*.yml
+.env
