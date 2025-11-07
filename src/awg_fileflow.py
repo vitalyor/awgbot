@@ -230,11 +230,59 @@ def _drop_peer_block_in_text(conf_text: str, pubkey: str) -> str:
     return "\n".join(out_lines) + ("\n" if out_lines and out_lines[-1] != "" else "")
 
 
-def apply_setconf() -> None:
+def _strip_to_interface_only(conf_text: str) -> str:
     """
-    Применяет текущий файл конфигурации к интерфейсу.
+    Возвращает только [Interface] секцию (всё до первого [Peer]).
     """
-    _require_ok(f"wg setconf {WG_IFACE} {CONF_PATH}")
+    lines = conf_text.splitlines()
+    out: List[str] = []
+    for line in lines:
+        if line.strip() == "[Peer]":
+            break
+        out.append(line)
+    # Гарантируем завершающий перевод строки
+    if out and out[-1] != "":
+        out.append("")
+    return "\n".join(out)
+
+
+def _has_peer_in_text(conf_text: str, pubkey: str) -> bool:
+    lines = conf_text.splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() == "[Peer]":
+            j = i + 1
+            while j < len(lines) and lines[j].strip() != "[Peer]":
+                s = lines[j].strip()
+                if s.startswith("PublicKey"):
+                    _, val = s.split("=", 1)
+                    if val.strip() == pubkey:
+                        return True
+                j += 1
+            i = j
+        else:
+            i += 1
+    return False
+
+
+def _ensure_slash32(ip_or_cidr: str) -> str:
+    ip_or_cidr = ip_or_cidr.strip()
+    if "/" not in ip_or_cidr:
+        ip_or_cidr = f"{ip_or_cidr}/32"
+    # валидация
+    _ = ipaddress.ip_interface(ip_or_cidr)
+    return ip_or_cidr
+
+
+def apply_syncconf() -> None:
+    """
+    Применяет текущий файл конфигурации к интерфейсу «как приложение»:
+    wg-quick strip + wg syncconf (поддерживает Address/J*/S*/H* в [Interface]).
+    """
+    # создаём временный «очищенный» конфиг без неподдерживаемых для wg setconf директив
+    _require_ok(f"wg-quick strip {WG_IFACE} || true")  # прогрев, на некоторых сборках первый вызов долго тянет
+    _require_ok(f"wg-quick strip {CONF_PATH} > /tmp/{WG_IFACE}.stripped")
+    _require_ok(f"wg syncconf {WG_IFACE} /tmp/{WG_IFACE}.stripped")
 
 
 # ───────────────────── публичные функции «песочницы» ─────────────────────
@@ -262,7 +310,12 @@ def add_peer_via_file_and_setconf(cli_pub: str, client_ip: str) -> None:
     Добавляет peer, редактируя файл wg0.conf и применяя wg setconf.
     """
     conf = _read_conf()
-    conf2 = _append_peer_block_in_text(conf, cli_pub, shared_psk(), client_ip)
+    client_ip = _ensure_slash32(client_ip)
+    # не дублируем peer, если уже есть в файле
+    if not _has_peer_in_text(conf, cli_pub):
+        conf2 = _append_peer_block_in_text(conf, cli_pub, shared_psk(), client_ip)
+    else:
+        conf2 = conf
     _atomic_write(
         "/mnt/.awg_conf.tmp", conf2
     )  # записать на хосте? мы в боте — пишем в контейнер через docker exec
@@ -270,7 +323,7 @@ def add_peer_via_file_and_setconf(cli_pub: str, client_ip: str) -> None:
     import base64
     payload_b64 = base64.b64encode(conf2.encode("utf-8")).decode("ascii")
     _require_ok(f"base64 -d > {CONF_PATH} <<B64\n{payload_b64}\nB64")
-    apply_setconf()
+    apply_syncconf()
 
 
 def remove_peer_via_file_and_setconf(pubkey: str) -> None:
@@ -279,13 +332,14 @@ def remove_peer_via_file_and_setconf(pubkey: str) -> None:
     import base64
     payload_b64 = base64.b64encode(conf2.encode("utf-8")).decode("ascii")
     _require_ok(f"base64 -d > {CONF_PATH} <<B64\n{payload_b64}\nB64")
-    apply_setconf()
+    apply_syncconf()
 
 
 def make_client_conf_text(cli_priv: str, assigned_ip: str) -> str:
     """
     Сборка клиентского .conf (AWG-совместимый), используя серверные параметры.
     """
+    assigned_ip = _ensure_slash32(assigned_ip)
     srv_pub = server_public_key()
     port = listen_port_from_dump(wg_dump()) or 0
     dns_ip = get_dns_ip()
@@ -296,7 +350,7 @@ def make_client_conf_text(cli_priv: str, assigned_ip: str) -> str:
         "[Interface]",
         f"PrivateKey = {cli_priv}",
         f"Address = {assigned_ip}",
-        f"DNS = {dns_ip}",
+        f"DNS = {dns_ip}, 1.0.0.1",
     ]
     for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
         if key in params:
@@ -314,6 +368,18 @@ def make_client_conf_text(cli_priv: str, assigned_ip: str) -> str:
     return "\n".join(lines)
 
 
+def facts() -> Dict[str, Any]:
+    """
+    Возвращает сводку для отладки (server pub, порт, obf-параметры).
+    """
+    rows = wg_dump()
+    return {
+        "server_pub": server_public_key(),
+        "listen_port": listen_port_from_dump(rows),
+        "obf": read_interface_obf_params(),
+    }
+
+
 def alloc_ip_from_runtime() -> str:
     """
     Возвращает свободный /32 в строковом виде, глядя на текущий wg dump.
@@ -323,3 +389,15 @@ def alloc_ip_from_runtime() -> str:
     used = used_client_ips(rows)
     ip = alloc_free_ip(subnet, used)
     return f"{ip}/32"
+
+
+def clean_all_peers() -> None:
+    """
+    Полностью очищает peers: в файле остаётся только [Interface], затем syncconf.
+    """
+    conf = _read_conf()
+    conf2 = _strip_to_interface_only(conf)
+    import base64
+    payload_b64 = base64.b64encode(conf2.encode("utf-8")).decode("ascii")
+    _require_ok(f"base64 -d > {CONF_PATH} <<B64\n{payload_b64}\nB64")
+    apply_syncconf()
