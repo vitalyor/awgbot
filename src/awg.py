@@ -261,6 +261,35 @@ def _gen_awg_obf_params() -> dict:
     return {"Jc": jc, "Jmin": jmin, "Jmax": jmax, "S1": s1, "S2": s2, "H1": h1, "H2": h2, "H3": h3, "H4": h4}
 
 
+# ==== вспомогательная функция для получения IP DNS-контейнера ====
+
+def _get_dns_ip() -> str:
+    """
+    Возвращает IP контейнера amnezia-dns, если он доступен в той же докер-сети.
+    Порядок попыток:
+      1) Внутри amnezia-awg: getent hosts amnezia-dns
+      2) На хосте: docker inspect ... amnezia-dns
+    Фолбэк — 1.1.1.1
+    """
+    try:
+        rc, out, _ = _sh("getent hosts amnezia-dns | awk '{print $1}'")
+        if rc == 0:
+            ip = (out or "").strip().splitlines()[0].strip()
+            # простая валидация IPv4
+            if ip.count('.') == 3:
+                return ip
+    except Exception:
+        pass
+    try:
+        rc, out, _ = run_cmd("docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' amnezia-dns")
+        if rc == 0:
+            ip = (out or '').strip()
+            if ip and ip.count('.') == 3:
+                return ip
+    except Exception:
+        pass
+    return "1.1.1.1"
+
 # ==== публичный API (используется bot.py) ====
 
 
@@ -434,12 +463,15 @@ def add_user(tid: int, name: str) -> Dict[str, Any]:
     # внешний endpoint (хост берём из util.AWG_CONNECT_HOST, порт — listen_port)
     endpoint = f"{AWG_CONNECT_HOST}:{port}"
 
+    # Получаем IP DNS-контейнера
+    dns_ip = _get_dns_ip()
+
     # Сформируем клиентский .conf (на данный момент это и будет "vpn_url" для вывода)
     wg_conf = (
         "[Interface]\n"
         f"PrivateKey = {cli_priv}\n"
         f"Address = {client_ip_cidr}\n"
-        f"DNS = 1.1.1.1\n"
+        f"DNS = {dns_ip}\n"
         f"Jc = {awg_params['Jc']}\n"
         f"Jmin = {awg_params['Jmin']}\n"
         f"Jmax = {awg_params['Jmax']}\n"
