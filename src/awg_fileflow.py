@@ -7,8 +7,8 @@ import tempfile
 import shutil
 
 # наши утилиты
-from core.docker import run_cmd
-from util import AWG_CONNECT_HOST
+from .core.docker import run_cmd
+from .util import AWG_CONNECT_HOST
 
 # параметры окружения/пути (совместимы с вашим стеком)
 AWG_CONTAINER = os.getenv("AWG_CONTAINER", "amnezia-awg")
