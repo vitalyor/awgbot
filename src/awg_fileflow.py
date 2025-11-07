@@ -127,6 +127,23 @@ def shared_psk() -> str:
     return _require_ok(f"cat {PSK_PATH}").strip()
 
 
+def get_external_ip() -> str:
+    """
+    Пытаемся взять внешний IP так же, как в проверенном скрипте:
+    сначала curl ifconfig.me, затем fallback на hostname -I (первый адрес).
+    """
+    rc, out, _ = _sh("curl -s ifconfig.me")
+    ip = (out or "").strip()
+    if ip:
+        return ip
+    rc, out, _ = _sh("hostname -I | awk '{print $1}'")
+    ip = (out or "").strip()
+    if ip:
+        return ip
+    # последний fallback — вернуть пустую строку (конфиг всё равно соберём)
+    return ""
+
+
 def get_dns_ip() -> str:
     """
     Возвращает IP контейнера amnezia-dns (если есть), иначе 1.1.1.1
@@ -274,14 +291,31 @@ def _ensure_slash32(ip_or_cidr: str) -> str:
     return ip_or_cidr
 
 
+def _upsert_peer_block_in_file(cli_pub: str, client_ip_cidr: str) -> None:
+    """
+    Удаляет из файла все блоки [Peer] с данным публичным ключом и добавляет новый.
+    После записи — применяет конфиг через apply_syncconf().
+    """
+    conf = _read_conf()
+    client_ip_cidr = _ensure_slash32(client_ip_cidr)
+    # вычистить все блоки с данным pubkey
+    conf = _drop_peer_block_in_text(conf, cli_pub)
+    # дописать новый блок (PSK общий как у приложения)
+    conf2 = _append_peer_block_in_text(conf, cli_pub, shared_psk(), client_ip_cidr)
+    import base64
+    payload_b64 = base64.b64encode(conf2.encode("utf-8")).decode("ascii")
+    _require_ok(f"base64 -d > {CONF_PATH} <<B64\n{payload_b64}\nB64")
+    apply_syncconf()
+
+
 def apply_syncconf() -> None:
     """
     Применяет текущий файл конфигурации к интерфейсу «как приложение»:
-    wg-quick strip + wg syncconf (поддерживает Address/J*/S*/H* в [Interface]).
+    wg-quick strip <CONF_PATH> > /tmp/<iface>.stripped
+    wg syncconf <iface> /tmp/<iface>.stripped
     """
-    # создаём временный «очищенный» конфиг без неподдерживаемых для wg setconf директив
-    _require_ok(f"wg-quick strip {WG_IFACE} || true")  # прогрев, на некоторых сборках первый вызов долго тянет
-    _require_ok(f"wg-quick strip {CONF_PATH} > /tmp/{WG_IFACE}.stripped")
+    # строго как делает клиент Amnezia:
+    _require_ok(f'wg-quick strip "{CONF_PATH}" > /tmp/{WG_IFACE}.stripped')
     _require_ok(f"wg syncconf {WG_IFACE} /tmp/{WG_IFACE}.stripped")
 
 
@@ -308,6 +342,7 @@ def list_peers() -> List[Dict[str, Any]]:
 def add_peer_via_file_and_setconf(cli_pub: str, client_ip: str) -> None:
     """
     Добавляет peer, редактируя файл wg0.conf и применяя wg setconf.
+    (Этот путь сохраняет общий PSK и применяет через strip+syncconf косвенно через apply_syncconf())
     """
     conf = _read_conf()
     client_ip = _ensure_slash32(client_ip)
@@ -401,3 +436,72 @@ def clean_all_peers() -> None:
     payload_b64 = base64.b64encode(conf2.encode("utf-8")).decode("ascii")
     _require_ok(f"base64 -d > {CONF_PATH} <<B64\n{payload_b64}\nB64")
     apply_syncconf()
+
+
+def create_peer_with_generated_keys(ip_cidr: str) -> Dict[str, Any]:
+    """
+    Полный сценарий «как в рабочем скрипте»:
+      - генерируем клиентские ключи (wg genkey → pubkey)
+      - удаляем из файла возможные дубликаты этого pub
+      - добавляем новый [Peer] (PSK — общий, как у приложения)
+      - применяем через wg-quick strip + wg syncconf
+      - формируем клиентский .conf для импорта (с J*/H* из [Interface])
+    Возвращает словарь с полями:
+      {
+        "client_private": ...,
+        "client_public": ...,
+        "assigned_ip": "10.x.x.x/32",
+        "server_public": ...,
+        "listen_port": 30213,
+        "endpoint": "X.X.X.X:PORT",
+        "client_conf": "<текст файла>",
+      }
+    """
+    ip_cidr = _ensure_slash32(ip_cidr)
+
+    # --- генерим ключи клиента ---
+    cli_priv = _require_ok("wg genkey").strip()
+    cli_pub = _require_ok(f'printf %s "{cli_priv}" | wg pubkey').strip()
+
+    # --- в файл: удалить старые блоки с этим pubkey и добавить новый ---
+    _upsert_peer_block_in_file(cli_pub, ip_cidr)
+
+    # --- собрать клиентский конфиг (.conf) ---
+    srv_pub = server_public_key()
+    rows = wg_dump()
+    port = listen_port_from_dump(rows) or 0
+    ext_ip = get_external_ip()
+    dns_ip = get_dns_ip()
+    params = read_interface_obf_params()
+
+    lines = [
+        "[Interface]",
+        f"Address = {ip_cidr}",
+        f"DNS = {dns_ip}, 1.0.0.1",
+        f"PrivateKey = {cli_priv}",
+    ]
+    for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
+        if key in params:
+            lines.append(f"{key} = {params[key]}")
+
+    lines += [
+        "",
+        "[Peer]",
+        f"PublicKey = {srv_pub}",
+        f"PresharedKey = {shared_psk()}",
+        "AllowedIPs = 0.0.0.0/0, ::/0",
+        f"Endpoint = {ext_ip}:{port}" if ext_ip else f"Endpoint = :{port}",
+        "PersistentKeepalive = 25",
+        "",
+    ]
+    conf_text = "\n".join(lines)
+
+    return {
+        "client_private": cli_priv,
+        "client_public": cli_pub,
+        "assigned_ip": ip_cidr,
+        "server_public": srv_pub,
+        "listen_port": port,
+        "endpoint": f"{ext_ip}:{port}" if ext_ip else f":{port}",
+        "client_conf": conf_text,
+    }
