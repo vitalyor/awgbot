@@ -22,6 +22,7 @@ awgbot.backups/
 .idea/
 .DS_Store
 .cache/
+tmpfile.txt
 
 # === Optional ===
 # можно убрать, если хочешь хранить .env.example

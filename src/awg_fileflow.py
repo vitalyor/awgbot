@@ -267,16 +267,18 @@ def add_peer_via_file_and_setconf(cli_pub: str, client_ip: str) -> None:
         "/mnt/.awg_conf.tmp", conf2
     )  # записать на хосте? мы в боте — пишем в контейнер через docker exec
     # мы внутри бота, поэтому перепишем файл через контейнер: echo > file не надёжен, используем here-doc
-    payload = conf2.replace("\\", "\\\\").replace("$", "\\$").replace("`", "\\`")
-    _require_ok(f"cat > {CONF_PATH} <<'EOF'\n{payload}\nEOF")
+    import base64
+    payload_b64 = base64.b64encode(conf2.encode("utf-8")).decode("ascii")
+    _require_ok(f"base64 -d > {CONF_PATH} <<B64\n{payload_b64}\nB64")
     apply_setconf()
 
 
 def remove_peer_via_file_and_setconf(pubkey: str) -> None:
     conf = _read_conf()
     conf2 = _drop_peer_block_in_text(conf, pubkey)
-    payload = conf2.replace("\\", "\\\\").replace("$", "\\$").replace("`", "\\`")
-    _require_ok(f"cat > {CONF_PATH} <<'EOF'\n{payload}\nEOF")
+    import base64
+    payload_b64 = base64.b64encode(conf2.encode("utf-8")).decode("ascii")
+    _require_ok(f"base64 -d > {CONF_PATH} <<B64\n{payload_b64}\nB64")
     apply_setconf()
 
 
