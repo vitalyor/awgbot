@@ -40,23 +40,20 @@ def _require_ok(cmd: str, timeout: int = 8) -> str:
 
 def _wg_dump() -> List[List[str]]:
     """
-    wg show wg0 dump → список строк, разбитых по табам.
-    Формат:
-      [0] interface|peer
-      [1] pubkey
-      [2] priv_or_psk
-      [3] listen_port | endpoint
-      [4] fwmark | allowed_ips
-      ...
-    Возвращаем только строки с peer (а также первую interface-строку отдельно).
+    wg show <iface> dump → список строк по табам.
+    Формат wg-dump:
+      # 0-я строка (интерфейс):
+      [0] private_key, [1] public_key, [2] listen_port, [3] fwmark
+      # 1..N строки (peers):
+      [0] peer_public_key, [1] preshared_key, [2] endpoint, [3] allowed_ips,
+          [4] latest_handshake, [5] transfer_rx, [6] transfer_tx, [7] persistent_keepalive
     """
-    out = _require_ok(f"wg show {WG_IFACE} dump || wg show all dump || true")
-    rows = []
+    out = _require_ok(f"wg show {WG_IFACE} dump || true")
+    rows: List[List[str]] = []
     for line in (out or "").splitlines():
         parts = line.strip().split("\t")
-        if not parts or parts[0] != WG_IFACE:
-            continue
-        rows.append(parts)
+        if parts:
+            rows.append(parts)
     return rows
 
 
@@ -67,7 +64,7 @@ def _listen_port_from_dump(rows: List[List[str]]) -> Optional[int]:
     if not rows:
         return None
     try:
-        return int(rows[0][3])
+        return int(rows[0][2])
     except Exception:
         return None
 
@@ -111,7 +108,7 @@ def _used_client_ips(rows: List[List[str]]) -> List[ipaddress.IPv4Address]:
     for parts in rows[1:]:
         if len(parts) < 5:
             continue
-        allowed = parts[4].strip()  # e.g. "10.8.1.23/32"
+        allowed = parts[3].strip() if len(parts) > 3 else ""  # e.g. "10.8.1.23/32"
         if not allowed or "/" not in allowed:
             continue
         try:
@@ -192,7 +189,7 @@ def _wg_add_peer(pubkey: str, client_ip: str) -> None:
 def _wg_remove_peer_by_pubkey(pubkey: str) -> bool:
     # Remove from running config
     rc, _, _ = _sh(f"wg set {WG_IFACE} peer {pubkey} remove")
-    ok_run = (rc == 0)
+    ok_run = rc == 0
     # Persist:
     rc_etc, _, _ = _sh(f"test -f /etc/wireguard/{WG_IFACE}.conf")
     if rc_etc == 0:
@@ -203,21 +200,21 @@ def _wg_remove_peer_by_pubkey(pubkey: str) -> bool:
     awk_prog = (
         'awk -v pk="{pk}" \''
         'BEGIN{{inpeer=0; keep=1; buf=""}}'
-        '/^\\[Peer\\]$/{{'
+        "/^\\[Peer\\]$/{{"
         '  if(inpeer){{ if(keep){{printf "%s", buf}} buf=""; }}'
-        '  inpeer=1; keep=1; buf=$0 ORS; next'
-        '}}'
-        '{{'
-        '  if(inpeer){{'
-        '    buf=buf $0 ORS;'
-        '    if($0 ~ /^PublicKey[ ]*=/){{'
+        "  inpeer=1; keep=1; buf=$0 ORS; next"
+        "}}"
+        "{{"
+        "  if(inpeer){{"
+        "    buf=buf $0 ORS;"
+        "    if($0 ~ /^PublicKey[ ]*=/){{"
         '      key=$0; sub(/^PublicKey[ ]*=[ ]*/, "", key);'
-        '      if(key==pk) keep=0;'
-        '    }}'
-        '    next'
-        '  }}'
-        '  print'
-        '}}'
+        "      if(key==pk) keep=0;"
+        "    }}"
+        "    next"
+        "  }}"
+        "  print"
+        "}}"
         'END{{ if(inpeer){{ if(keep) printf "%s", buf }} }}\' {conf} > {conf}.tmp && mv {conf}.tmp {conf}'
     ).format(pk=pubkey, conf=CONF_PATH)
     rc2, _, _ = _sh(awk_prog)
@@ -258,10 +255,21 @@ def _gen_awg_obf_params() -> dict:
     while len(hs) < 4:
         hs.add(random.randint(1, 2**31 - 1))
     h1, h2, h3, h4 = list(hs)
-    return {"Jc": jc, "Jmin": jmin, "Jmax": jmax, "S1": s1, "S2": s2, "H1": h1, "H2": h2, "H3": h3, "H4": h4}
+    return {
+        "Jc": jc,
+        "Jmin": jmin,
+        "Jmax": jmax,
+        "S1": s1,
+        "S2": s2,
+        "H1": h1,
+        "H2": h2,
+        "H3": h3,
+        "H4": h4,
+    }
 
 
 # ==== вспомогательная функция для получения IP DNS-контейнера ====
+
 
 def _get_dns_ip() -> str:
     """
@@ -273,22 +281,25 @@ def _get_dns_ip() -> str:
     """
     try:
         rc, out, _ = _sh("getent hosts amnezia-dns | awk '{print $1}'")
-        if rc == 0:
-            ip = (out or "").strip().splitlines()[0].strip()
-            # простая валидация IPv4
-            if ip.count('.') == 3:
+        if rc == 0 and out:
+            first_line = (out or "").strip().splitlines()[0]
+            ip = first_line.split()[0].strip()
+            if ip.count(".") == 3:
                 return ip
     except Exception:
         pass
     try:
-        rc, out, _ = run_cmd("docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' amnezia-dns")
+        rc, out, _ = run_cmd(
+            "docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' amnezia-dns"
+        )
         if rc == 0:
-            ip = (out or '').strip()
-            if ip and ip.count('.') == 3:
+            ip = (out or "").strip()
+            if ip and ip.count(".") == 3:
                 return ip
     except Exception:
         pass
     return "1.1.1.1"
+
 
 # ==== публичный API (используется bot.py) ====
 
@@ -305,16 +316,16 @@ def list_all() -> List[Dict[str, Any]]:
         if len(parts) < 5:
             continue
         d: Dict[str, Any] = {
-            "pubkey": parts[1],
-            "preshared_key": parts[2],
-            "endpoint": parts[3],
-            "allowed_ips": parts[4],
+            "pubkey": parts[0],
+            "preshared_key": parts[1] if len(parts) > 1 else "",
+            "endpoint": parts[2] if len(parts) > 2 else "",
+            "allowed_ips": parts[3] if len(parts) > 3 else "",
         }
-        # хвостовые метрики зависят от версии wg
-        if len(parts) >= 9:
-            d["latest_handshake"] = parts[5]
-            d["transfer_rx"] = parts[6]
-            d["transfer_tx"] = parts[7]
+        if len(parts) > 7:
+            d["latest_handshake"] = parts[4]
+            d["transfer_rx"] = parts[5]
+            d["transfer_tx"] = parts[6]
+            d["persistent_keepalive"] = parts[7]
         out.append(d)
     return out
 
@@ -348,7 +359,7 @@ def find_user(tid: int, name: str) -> Optional[Dict[str, Any]]:
     for parts in rows[1:]:
         if len(parts) < 5:
             continue
-        allowed = parts[4]
+        allowed = parts[3] if len(parts) > 3 else ""
         if allowed.startswith(f"{ip}/"):
             endpoint = parts[3]  # как правило "(none)" для клиента за NAT
             return {
@@ -451,7 +462,7 @@ def add_user(tid: int, name: str) -> Dict[str, Any]:
         gen = _gen_awg_obf_params()
         awg_params.update({k: gen[k] for k in ("H1", "H2", "H3", "H4")})
         # fill missing J*/S* with generated defaults if any None
-        for k in ("Jc","Jmin","Jmax","S1","S2"):
+        for k in ("Jc", "Jmin", "Jmax", "S1", "S2"):
             if awg_params.get(k) is None:
                 awg_params[k] = gen[k if k in gen else k]
     else:
