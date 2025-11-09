@@ -212,12 +212,10 @@ def get_dns_ip() -> str:
 def read_interface_obf_params() -> Dict[str, int]:
     """
     Read Jc/Jmin/Jmax/S1/S2/H1..H4 from [Interface] in wg0.conf (if any).
-    If not found in file, also try runtime `wg show wg0` (which prints them as
-    lowercase keys like `jc:`) and map them back to proper names.
+    Always merge with runtime `wg show <iface>` output for missing keys.
     """
     want_keys = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
-    file_res: Dict[str, int] = {}
-
+    merged: Dict[str, int] = {}
     # 1) From file (case-insensitive)
     try:
         cfg = _require_ok(f"cat {CONF_PATH}")
@@ -226,10 +224,10 @@ def read_interface_obf_params() -> Dict[str, int]:
             s = line.strip()
             if not s:
                 continue
-            if s == "[Interface]":
+            if s.lower() == "[interface]":
                 in_iface = True
                 continue
-            if s == "[Peer]":
+            if s.lower() == "[peer]":
                 break
             if in_iface and "=" in s and not s.startswith("#"):
                 k, v = [x.strip() for x in s.split("=", 1)]
@@ -237,37 +235,35 @@ def read_interface_obf_params() -> Dict[str, int]:
                 for want in want_keys:
                     if kl == want.lower():
                         try:
-                            file_res[want] = int(v)
+                            merged[want] = int(v)
                         except Exception:
                             pass
                         break
     except Exception:
         pass
 
-    if file_res:
-        return file_res
-
-    # 2) Fallback: from runtime `wg show <iface>` (prints as `jc: 2`, etc.)
-    try:
-        out = _require_ok(f"wg show {WG_IFACE} || true")
-        run_res: Dict[str, int] = {}
-        for line in out.splitlines():
-            s = line.strip()
-            if ":" not in s:
-                continue
-            k, v = s.split(":", 1)
-            kl = k.strip().lower()
-            val = v.strip()
-            for want in want_keys:
-                if kl == want.lower():
-                    try:
-                        run_res[want] = int(val)
-                    except Exception:
-                        pass
-                    break
-        return run_res
-    except Exception:
-        return {}
+    # 2) For missing keys, try runtime `wg show <iface>`
+    missing_keys = [k for k in want_keys if k not in merged]
+    if missing_keys:
+        try:
+            out = _require_ok(f"wg show {WG_IFACE} || true")
+            for line in out.splitlines():
+                s = line.strip()
+                if ":" not in s:
+                    continue
+                k, v = s.split(":", 1)
+                kl = k.strip().lower()
+                val = v.strip()
+                for want in missing_keys:
+                    if kl == want.lower():
+                        try:
+                            merged[want] = int(val)
+                        except Exception:
+                            pass
+                        break
+        except Exception:
+            pass
+    return merged
 
 
 def _ensure_interface_has_obf(conf_text: str) -> str:
@@ -321,25 +317,35 @@ def _read_conf() -> str:
 
 
 def _write_conf_text_atomic(conf_text: str) -> None:
+    # 1) Validate conf_text before writing
+    if "[Interface]" not in conf_text or len(conf_text) < 40:
+        raise RuntimeError("Refusing to write suspicious conf_text")
+
     encoded = base64.b64encode(conf_text.encode("utf-8")).decode("ascii")
-    # Write base64 payload into a temp file first (no locking needed for /tmp)
     tmp_b64 = f"/tmp/{WG_IFACE}.conf.b64"
     tmp_plain = f"/tmp/{WG_IFACE}.conf.tmp"
 
-    # 1) dump base64 safely via here-doc (no command nesting)
+    # Write base64 payload into a temp file first (no locking needed for /tmp)
     _require_ok(f"cat > {tmp_b64} <<'B64'\n{encoded}\nB64")
-    # 2) decode into plain temp file
+    # Decode into plain temp file
     _require_ok(f"base64 -d {tmp_b64} > {tmp_plain}")
 
-    # 3) move atomically under a file lock if flock exists
+    # Move atomically under a file lock if flock exists
     rc, _, _ = _sh("command -v flock >/dev/null 2>&1")
     if rc == 0:
-        # Use a very simple -c string to avoid quoting pitfalls
         _require_ok(f"flock -x {LOCK_PATH} -c 'mv -f {tmp_plain} {CONF_PATH}; rm -f {tmp_b64}'")
     else:
         _require_ok(f"mv -f {tmp_plain} {CONF_PATH}; rm -f {tmp_b64}")
 
     _secure_conf_perms()
+
+    # 2) After moving, re-validate the written file
+    try:
+        written = _require_ok(f"cat {CONF_PATH}")
+        if "[Interface]" not in written or len(written.strip()) == 0:
+            raise RuntimeError("Refusing to write suspicious conf_text (post-write)")
+    except Exception:
+        raise RuntimeError("Refusing to write suspicious conf_text (readback fail)")
 
 
 def _append_peer_block_in_text(
@@ -496,14 +502,70 @@ def alloc_ip_from_runtime() -> str:
 
 def ensure_interface_obf() -> None:
     """
-    If some J*/H* keys are missing in [Interface] and ENV defaults exist,
-    write them in and re-apply.
+    Ensure [Interface] section has all obfuscation keys from config and runtime.
+    If missing, append them, write the config, but do not apply.
     """
     conf = _read_conf()
-    new_conf = _ensure_interface_has_obf(conf)
-    if new_conf != conf:
-        _write_conf_text_atomic(new_conf)
-        apply_syncconf()
+    want_keys = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
+    # 1) Parse current obf params from file section [Interface] (case-insensitive)
+    have = {}
+    in_iface = False
+    lines = conf.splitlines()
+    for line in lines:
+        s = line.strip()
+        if s.lower() == "[interface]":
+            in_iface = True
+            continue
+        if s.lower() == "[peer]":
+            if in_iface:
+                break
+        if in_iface and "=" in s and not s.startswith("#"):
+            k, v = [x.strip() for x in s.split("=", 1)]
+            kl = k.lower()
+            for want in want_keys:
+                if kl == want.lower():
+                    try:
+                        have[want] = int(v)
+                    except Exception:
+                        pass
+                    break
+    # 2) Merge with runtime
+    merged = read_interface_obf_params()
+    # 3) Find missing keys, prepare additions
+    missing = [k for k in want_keys if k not in have and k in merged]
+    if not missing:
+        return
+
+    # Helper: find where to insert lines into [Interface]
+    def insert_into_interface_section(conf_lines: List[str], additions: List[str]) -> List[str]:
+        out = []
+        in_iface = False
+        inserted = False
+        for idx, line in enumerate(conf_lines):
+            s = line.strip()
+            if s.lower() == "[interface]":
+                in_iface = True
+                out.append(line)
+                continue
+            if in_iface and s.lower() == "[peer]":
+                # Insert additions just before first [Peer]
+                out.extend(additions)
+                inserted = True
+                out.append(line)
+                in_iface = False
+                continue
+            out.append(line)
+        if in_iface and not inserted:
+            # No [Peer] found, append at end of [Interface]
+            out.extend(additions)
+        return out
+
+    additions = [f"{k} = {merged[k]}" for k in missing]
+    new_lines = insert_into_interface_section(lines, additions)
+    new_conf = "\n".join(new_lines)
+    if not new_conf.endswith("\n"):
+        new_conf += "\n"
+    _write_conf_text_atomic(new_conf)
 
 
 def add_peer_with_pubkey(cli_pub: str, client_ip: str) -> None:
