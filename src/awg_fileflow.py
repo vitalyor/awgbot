@@ -3,45 +3,97 @@ from __future__ import annotations
 from typing import Dict, Any, List, Optional, Tuple
 import ipaddress
 import os
-import tempfile
-import shutil
+import base64
 
-# наши утилиты
-from .core.docker import run_cmd
-from .util import AWG_CONNECT_HOST
+# ─────────────────────────────────────────────────────────────────────────────
+# Imports that work both when this file is imported as a top-level module
+# (e.g. "import awg_fileflow") and when imported as part of the package
+# (e.g. "from src.awg_fileflow import ...").
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    # when used as a package: `from src.awg_fileflow import ...`
+    from .core.docker import run_cmd  # type: ignore
+    from .util import AWG_CONNECT_HOST  # type: ignore
+except Exception:
+    # when used as a top-level module: `import awg_fileflow`
+    from core.docker import run_cmd  # type: ignore
+    from util import AWG_CONNECT_HOST  # type: ignore
 
-# параметры окружения/пути (совместимы с вашим стеком)
+# ─────────────────────────────────────────────────────────────────────────────
+# Paths & constants (compatible with your stack)
+# ─────────────────────────────────────────────────────────────────────────────
 AWG_CONTAINER = os.getenv("AWG_CONTAINER", "amnezia-awg")
 WG_IFACE = os.getenv("AWG_IFACE", "wg0")
 CONF_DIR = "/opt/amnezia/awg"
 CONF_PATH = f"{CONF_DIR}/{WG_IFACE}.conf"
 PSK_PATH = f"{CONF_DIR}/wireguard_psk.key"
 SERVER_PUB = f"{CONF_DIR}/wireguard_server_public_key.key"
+LOCK_PATH = f"{CONF_DIR}/.conf.lock"
 
-# ───────────────────── низкоуровневые вызовы ─────────────────────
+# Default (fallback) obfuscation values (used if not present in file).
+# If you want to force specific values, set these ENV vars in the AWG container.
+ENV_OBF_DEFAULTS = {
+    "Jc": os.getenv("AWG_JC"),
+    "Jmin": os.getenv("AWG_JMIN"),
+    "Jmax": os.getenv("AWG_JMAX"),
+    "S1": os.getenv("AWG_S1"),
+    "S2": os.getenv("AWG_S2"),
+    "H1": os.getenv("AWG_H1"),
+    "H2": os.getenv("AWG_H2"),
+    "H3": os.getenv("AWG_H3"),
+    "H4": os.getenv("AWG_H4"),
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Low-level shell helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-def _sh(cmd: str, timeout: int = 8) -> Tuple[int, str, str]:
+def _sh(cmd: str, timeout: int = 15) -> Tuple[int, str, str]:
+    """Run a command inside the AWG container."""
     full = f"docker exec {AWG_CONTAINER} sh -lc {repr(cmd)}"
-    rc, out, err = run_cmd(full)
+    rc, out, err = run_cmd(full, timeout=timeout)
     return rc, (out or ""), (err or "")
 
 
-def _require_ok(cmd: str, timeout: int = 8) -> str:
+def _require_ok(cmd: str, timeout: int = 15) -> str:
     rc, out, err = _sh(cmd, timeout=timeout)
     if rc != 0:
         raise RuntimeError(f"cmd failed: {cmd}\nrc={rc}\n{err}")
     return out
 
 
-# ───────────────────── парсинг состояния wg ─────────────────────
+def _secure_conf_perms() -> None:
+    """Make sure config & keys have strict perms (mirrors app behavior)."""
+    _require_ok(
+        f"chown root:root {CONF_PATH} {PSK_PATH} {SERVER_PUB} 2>/dev/null || true"
+    )
+    _require_ok(f"chmod 600 {CONF_PATH} {PSK_PATH} {SERVER_PUB} 2>/dev/null || true")
+    _require_ok(f"chmod 700 {CONF_DIR} 2>/dev/null || true")
+
+
+def _with_lock(cmd: str) -> str:
+    """
+    Serialize edits to {CONF_PATH}. Uses flock if present; otherwise just runs.
+    """
+    # Prefer util-linux flock if available
+    rc, _, _ = _sh("command -v flock >/dev/null 2>&1")
+    if rc == 0:
+        return _require_ok(f"flock -x {LOCK_PATH} -c {repr(cmd)}")
+    # Fallback: best effort without lock
+    return _require_ok(cmd)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WG inspection
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def wg_dump() -> List[List[str]]:
     """
-    wg show <iface> dump → список строк (колонки табами):
-      0-я строка (интерфейс): [0]priv, [1]pub, [2]listen_port, [3]fwmark
-      peer-строки (NR>1):     [0]pub, [1]psk, [2]endpoint, [3]allowed_ips, [4]handshake, [5]rx, [6]tx, [7]keepalive
+    wg show <iface> dump → list of rows split by tabs.
+      Row 0 (interface): [0]priv, [1]pub, [2]listen_port, [3]fwmark, ...
+      Peer rows (NR>1):  [0]pub, [1]psk, [2]endpoint, [3]allowed_ips, [4]handshake, [5]rx, [6]tx, [7]keepalive
     """
     out = _require_ok(f"wg show {WG_IFACE} dump || true")
     rows: List[List[str]] = []
@@ -56,14 +108,14 @@ def listen_port_from_dump(rows: List[List[str]]) -> Optional[int]:
     if not rows:
         return None
     try:
-        return int(rows[0][2])  # listen_port в [2]
+        return int(rows[0][2])
     except Exception:
         return None
 
 
 def server_subnet() -> ipaddress.IPv4Network:
     """
-    Определяем подсеть wg0. Сначала пробуем ip addr, потом Address в конфиге.
+    Detect WG subnet for wg0, first via ip addr, then via Address= in config.
     """
     out = _require_ok("ip -brief addr || ip a || true")
     cidr = None
@@ -90,7 +142,7 @@ def server_subnet() -> ipaddress.IPv4Network:
 def used_client_ips(rows: List[List[str]]) -> List[ipaddress.IPv4Address]:
     used: List[ipaddress.IPv4Address] = []
     for parts in rows[1:]:
-        if len(parts) < 4:  # peers
+        if len(parts) < 4:
             continue
         allowed = parts[3].strip()
         if not allowed or "/" not in allowed:
@@ -108,7 +160,8 @@ def alloc_free_ip(
 ) -> ipaddress.IPv4Address:
     used_set = set(used)
     for ip in subnet.hosts():
-        if ip.packed[-1] < 2:  # .0,.1 пропускаем
+        # skip .0 and .1
+        if ip.packed[-1] < 2:
             continue
         if ip in used_set:
             continue
@@ -116,7 +169,9 @@ def alloc_free_ip(
     raise RuntimeError("No free IPs left in WG subnet")
 
 
-# ───────────────────── вспомогательные ─────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def server_public_key() -> str:
@@ -127,26 +182,9 @@ def shared_psk() -> str:
     return _require_ok(f"cat {PSK_PATH}").strip()
 
 
-def get_external_ip() -> str:
-    """
-    Пытаемся взять внешний IP так же, как в проверенном скрипте:
-    сначала curl ifconfig.me, затем fallback на hostname -I (первый адрес).
-    """
-    rc, out, _ = _sh("curl -s ifconfig.me")
-    ip = (out or "").strip()
-    if ip:
-        return ip
-    rc, out, _ = _sh("hostname -I | awk '{print $1}'")
-    ip = (out or "").strip()
-    if ip:
-        return ip
-    # последний fallback — вернуть пустую строку (конфиг всё равно соберём)
-    return ""
-
-
 def get_dns_ip() -> str:
     """
-    Возвращает IP контейнера amnezia-dns (если есть), иначе 1.1.1.1
+    Return amnezia-dns IP if available, otherwise 1.1.1.1
     """
     try:
         rc, out, _ = _sh("getent hosts amnezia-dns")
@@ -170,15 +208,15 @@ def get_dns_ip() -> str:
     return "1.1.1.1"
 
 
-def read_interface_obf_params() -> dict:
+def read_interface_obf_params() -> Dict[str, int]:
     """
-    Читает из [Interface] секции wg0.conf поля AWG: Jc/Jmin/Jmax/S1/S2/H1..H4 (если есть)
+    Read Jc/Jmin/Jmax/S1/S2/H1..H4 from [Interface] in wg0.conf (if any).
     """
     try:
         cfg = _require_ok(f"cat {CONF_PATH}")
     except Exception:
         return {}
-    res = {}
+    res: Dict[str, int] = {}
     for line in cfg.splitlines():
         s = line.strip()
         if not s or s.startswith("#") or "=" not in s:
@@ -192,28 +230,73 @@ def read_interface_obf_params() -> dict:
     return res
 
 
-# ───────────────────── работа с файлом конфигурации ─────────────────────
+def _ensure_interface_has_obf(conf_text: str) -> str:
+    """
+    Ensure [Interface] section contains obfuscation params.
+    - Keep values already present.
+    - If some are missing and an ENV default exists, append it.
+    """
+    lines = conf_text.splitlines()
+    out: List[str] = []
+    in_iface = False
+    seen: Dict[str, bool] = {
+        k: False for k in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
+    }
+
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s == "[Interface]":
+            in_iface = True
+            out.append(line)
+            continue
+        if s == "[Peer]":
+            # before leaving the interface block, append missing keys (if we have defaults)
+            for k in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
+                if not seen[k] and ENV_OBF_DEFAULTS.get(k) is not None:
+                    out.append(f"{k} = {int(ENV_OBF_DEFAULTS[k])}")
+            in_iface = False
+            out.append(line)
+            continue
+
+        if in_iface and "=" in s and not s.startswith("#"):
+            k = s.split("=", 1)[0].strip()
+            if k in seen:
+                seen[k] = True
+
+        out.append(line)
+
+    # If there is no [Peer] at all, ensure we still appended to the end of [Interface]
+    if in_iface:
+        for k in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
+            if not seen[k] and ENV_OBF_DEFAULTS.get(k) is not None:
+                out.append(f"{k} = {int(ENV_OBF_DEFAULTS[k])}")
+
+    return "\n".join(out) + ("\n" if out and out[-1] != "" else "")
 
 
-def _atomic_write(path: str, content: str) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(content)
-    os.replace(tmp, path)
+# ─────────────────────────────────────────────────────────────────────────────
+# Config text helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _read_conf() -> str:
     return _require_ok(f"cat {CONF_PATH}")
 
 
+def _write_conf_text_atomic(conf_text: str) -> None:
+    encoded = base64.b64encode(conf_text.encode("utf-8")).decode("ascii")
+    _with_lock(f"base64 -d > {CONF_PATH} <<'B64'\n{encoded}\nB64")
+    _secure_conf_perms()
+
+
 def _append_peer_block_in_text(
-    conf_text: str, pubkey: str, psk_val: str, client_ip: str
+    conf_text: str, pubkey: str, psk_val: str, client_ip_cidr: str
 ) -> str:
     block = (
         "\n[Peer]\n"
         f"PublicKey = {pubkey}\n"
         f"PresharedKey = {psk_val}\n"
-        f"AllowedIPs = {client_ip}/32\n"
+        f"AllowedIPs = {client_ip_cidr}\n"
         "PersistentKeepalive = 25\n"
     )
     return conf_text.rstrip() + block
@@ -226,7 +309,6 @@ def _drop_peer_block_in_text(conf_text: str, pubkey: str) -> str:
     while i < len(lines):
         line = lines[i]
         if line.strip() == "[Peer]":
-            # собрать блок
             j = i + 1
             buf = [line]
             keep = True
@@ -249,7 +331,7 @@ def _drop_peer_block_in_text(conf_text: str, pubkey: str) -> str:
 
 def _strip_to_interface_only(conf_text: str) -> str:
     """
-    Возвращает только [Interface] секцию (всё до первого [Peer]).
+    Return only [Interface] section (everything before the first [Peer]).
     """
     lines = conf_text.splitlines()
     out: List[str] = []
@@ -257,7 +339,6 @@ def _strip_to_interface_only(conf_text: str) -> str:
         if line.strip() == "[Peer]":
             break
         out.append(line)
-    # Гарантируем завершающий перевод строки
     if out and out[-1] != "":
         out.append("")
     return "\n".join(out)
@@ -286,40 +367,38 @@ def _ensure_slash32(ip_or_cidr: str) -> str:
     ip_or_cidr = ip_or_cidr.strip()
     if "/" not in ip_or_cidr:
         ip_or_cidr = f"{ip_or_cidr}/32"
-    # валидация
-    _ = ipaddress.ip_interface(ip_or_cidr)
+    _ = ipaddress.ip_interface(ip_or_cidr)  # validate
     return ip_or_cidr
-
-
-def _upsert_peer_block_in_file(cli_pub: str, client_ip_cidr: str) -> None:
-    """
-    Удаляет из файла все блоки [Peer] с данным публичным ключом и добавляет новый.
-    После записи — применяет конфиг через apply_syncconf().
-    """
-    conf = _read_conf()
-    client_ip_cidr = _ensure_slash32(client_ip_cidr)
-    # вычистить все блоки с данным pubkey
-    conf = _drop_peer_block_in_text(conf, cli_pub)
-    # дописать новый блок (PSK общий как у приложения)
-    conf2 = _append_peer_block_in_text(conf, cli_pub, shared_psk(), client_ip_cidr)
-    import base64
-    payload_b64 = base64.b64encode(conf2.encode("utf-8")).decode("ascii")
-    _require_ok(f"base64 -d > {CONF_PATH} <<B64\n{payload_b64}\nB64")
-    apply_syncconf()
 
 
 def apply_syncconf() -> None:
     """
-    Применяет текущий файл конфигурации к интерфейсу «как приложение»:
-    wg-quick strip <CONF_PATH> > /tmp/<iface>.stripped
-    wg syncconf <iface> /tmp/<iface>.stripped
+    Apply config the same way the official app does:
+      wg-quick strip <CONF_PATH> > /tmp/<iface>.stripped
+      wg syncconf <iface> /tmp/<iface>.stripped
     """
-    # строго как делает клиент Amnezia:
+    _secure_conf_perms()
     _require_ok(f'wg-quick strip "{CONF_PATH}" > /tmp/{WG_IFACE}.stripped')
     _require_ok(f"wg syncconf {WG_IFACE} /tmp/{WG_IFACE}.stripped")
 
 
-# ───────────────────── публичные функции «песочницы» ─────────────────────
+def _upsert_peer_block_in_file(cli_pub: str, client_ip_cidr: str) -> None:
+    """
+    Remove any [Peer] block with the same pubkey and append a fresh one,
+    preserving/ensuring obfuscation params in [Interface], then apply syncconf.
+    """
+    conf = _read_conf()
+    conf = _ensure_interface_has_obf(conf)
+    client_ip_cidr = _ensure_slash32(client_ip_cidr)
+    conf = _drop_peer_block_in_text(conf, cli_pub)
+    conf2 = _append_peer_block_in_text(conf, cli_pub, shared_psk(), client_ip_cidr)
+    _write_conf_text_atomic(conf2)
+    apply_syncconf()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API for the debug workflow
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def list_peers() -> List[Dict[str, Any]]:
@@ -339,73 +418,9 @@ def list_peers() -> List[Dict[str, Any]]:
     return out
 
 
-def add_peer_via_file_and_setconf(cli_pub: str, client_ip: str) -> None:
-    """
-    Добавляет peer, редактируя файл wg0.conf и применяя wg setconf.
-    (Этот путь сохраняет общий PSK и применяет через strip+syncconf косвенно через apply_syncconf())
-    """
-    conf = _read_conf()
-    client_ip = _ensure_slash32(client_ip)
-    # не дублируем peer, если уже есть в файле
-    if not _has_peer_in_text(conf, cli_pub):
-        conf2 = _append_peer_block_in_text(conf, cli_pub, shared_psk(), client_ip)
-    else:
-        conf2 = conf
-    _atomic_write(
-        "/mnt/.awg_conf.tmp", conf2
-    )  # записать на хосте? мы в боте — пишем в контейнер через docker exec
-    # мы внутри бота, поэтому перепишем файл через контейнер: echo > file не надёжен, используем here-doc
-    import base64
-    payload_b64 = base64.b64encode(conf2.encode("utf-8")).decode("ascii")
-    _require_ok(f"base64 -d > {CONF_PATH} <<B64\n{payload_b64}\nB64")
-    apply_syncconf()
-
-
-def remove_peer_via_file_and_setconf(pubkey: str) -> None:
-    conf = _read_conf()
-    conf2 = _drop_peer_block_in_text(conf, pubkey)
-    import base64
-    payload_b64 = base64.b64encode(conf2.encode("utf-8")).decode("ascii")
-    _require_ok(f"base64 -d > {CONF_PATH} <<B64\n{payload_b64}\nB64")
-    apply_syncconf()
-
-
-def make_client_conf_text(cli_priv: str, assigned_ip: str) -> str:
-    """
-    Сборка клиентского .conf (AWG-совместимый), используя серверные параметры.
-    """
-    assigned_ip = _ensure_slash32(assigned_ip)
-    srv_pub = server_public_key()
-    port = listen_port_from_dump(wg_dump()) or 0
-    dns_ip = get_dns_ip()
-    params = read_interface_obf_params()  # Jc/Jmin/Jmax/S1/S2/H1..H4
-    endpoint = f"{AWG_CONNECT_HOST}:{port}"
-
-    lines = [
-        "[Interface]",
-        f"PrivateKey = {cli_priv}",
-        f"Address = {assigned_ip}",
-        f"DNS = {dns_ip}, 1.0.0.1",
-    ]
-    for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
-        if key in params:
-            lines.append(f"{key} = {params[key]}")
-    lines += [
-        "",
-        "[Peer]",
-        f"PublicKey = {srv_pub}",
-        f"PresharedKey = {shared_psk()}",
-        f"Endpoint = {endpoint}",
-        "AllowedIPs = 0.0.0.0/0, ::/0",
-        "PersistentKeepalive = 25",
-        "",
-    ]
-    return "\n".join(lines)
-
-
 def facts() -> Dict[str, Any]:
     """
-    Возвращает сводку для отладки (server pub, порт, obf-параметры).
+    Return facts for quick sanity checks.
     """
     rows = wg_dump()
     return {
@@ -417,7 +432,7 @@ def facts() -> Dict[str, Any]:
 
 def alloc_ip_from_runtime() -> str:
     """
-    Возвращает свободный /32 в строковом виде, глядя на текущий wg dump.
+    Return a free /32 from current runtime dump.
     """
     rows = wg_dump()
     subnet = server_subnet()
@@ -426,57 +441,59 @@ def alloc_ip_from_runtime() -> str:
     return f"{ip}/32"
 
 
-def clean_all_peers() -> None:
+def ensure_interface_obf() -> None:
     """
-    Полностью очищает peers: в файле остаётся только [Interface], затем syncconf.
+    If some J*/H* keys are missing in [Interface] and ENV defaults exist,
+    write them in and re-apply.
     """
     conf = _read_conf()
-    conf2 = _strip_to_interface_only(conf)
-    import base64
-    payload_b64 = base64.b64encode(conf2.encode("utf-8")).decode("ascii")
-    _require_ok(f"base64 -d > {CONF_PATH} <<B64\n{payload_b64}\nB64")
+    new_conf = _ensure_interface_has_obf(conf)
+    if new_conf != conf:
+        _write_conf_text_atomic(new_conf)
+        apply_syncconf()
+
+
+def add_peer_with_pubkey(cli_pub: str, client_ip: str) -> None:
+    """
+    Add a peer using an already-known public key.
+    """
+    client_ip = _ensure_slash32(client_ip)
+    _upsert_peer_block_in_file(cli_pub, client_ip)
+
+
+def remove_peer(pubkey: str) -> None:
+    conf = _read_conf()
+    conf2 = _drop_peer_block_in_text(conf, pubkey)
+    _write_conf_text_atomic(conf2)
     apply_syncconf()
 
 
-def create_peer_with_generated_keys(ip_cidr: str) -> Dict[str, Any]:
+def clean_all_peers() -> None:
     """
-    Полный сценарий «как в рабочем скрипте»:
-      - генерируем клиентские ключи (wg genkey → pubkey)
-      - удаляем из файла возможные дубликаты этого pub
-      - добавляем новый [Peer] (PSK — общий, как у приложения)
-      - применяем через wg-quick strip + wg syncconf
-      - формируем клиентский .conf для импорта (с J*/H* из [Interface])
-    Возвращает словарь с полями:
-      {
-        "client_private": ...,
-        "client_public": ...,
-        "assigned_ip": "10.x.x.x/32",
-        "server_public": ...,
-        "listen_port": 30213,
-        "endpoint": "X.X.X.X:PORT",
-        "client_conf": "<текст файла>",
-      }
+    Keep only [Interface] in the file, preserving/adding obfuscation, then apply.
     """
-    ip_cidr = _ensure_slash32(ip_cidr)
+    conf = _read_conf()
+    conf2 = _strip_to_interface_only(conf)
+    conf2 = _ensure_interface_has_obf(conf2)
+    _write_conf_text_atomic(conf2)
+    apply_syncconf()
 
-    # --- генерим ключи клиента ---
-    cli_priv = _require_ok("wg genkey").strip()
-    cli_pub = _require_ok(f'printf %s "{cli_priv}" | wg pubkey').strip()
 
-    # --- в файл: удалить старые блоки с этим pubkey и добавить новый ---
-    _upsert_peer_block_in_file(cli_pub, ip_cidr)
-
-    # --- собрать клиентский конфиг (.conf) ---
+def make_client_conf_text(cli_priv: str, assigned_ip: str) -> str:
+    """
+    Build a client config (AWG compatible) using server params.
+    """
+    assigned_ip = _ensure_slash32(assigned_ip)
     srv_pub = server_public_key()
-    rows = wg_dump()
-    port = listen_port_from_dump(rows) or 0
-    ext_ip = get_external_ip()
+    port = listen_port_from_dump(wg_dump()) or 0
     dns_ip = get_dns_ip()
     params = read_interface_obf_params()
+    endpoint_host = AWG_CONNECT_HOST  # keep deterministic; no autodetect here
+    endpoint = f"{endpoint_host}:{port}" if endpoint_host else f":{port}"
 
     lines = [
         "[Interface]",
-        f"Address = {ip_cidr}",
+        f"Address = {assigned_ip}",
         f"DNS = {dns_ip}, 1.0.0.1",
         f"PrivateKey = {cli_priv}",
     ]
@@ -490,11 +507,61 @@ def create_peer_with_generated_keys(ip_cidr: str) -> Dict[str, Any]:
         f"PublicKey = {srv_pub}",
         f"PresharedKey = {shared_psk()}",
         "AllowedIPs = 0.0.0.0/0, ::/0",
-        f"Endpoint = {ext_ip}:{port}" if ext_ip else f"Endpoint = :{port}",
+        f"Endpoint = {endpoint}",
         "PersistentKeepalive = 25",
         "",
     ]
-    conf_text = "\n".join(lines)
+    return "\n".join(lines)
+
+
+def create_peer_with_generated_keys(ip_cidr: str) -> Dict[str, Any]:
+    """
+    Full flow (mirrors the good shell script):
+      - generate client keys (wg genkey → pubkey)
+      - ensure [Interface] has obfuscation values (preserve or fill from ENV)
+      - remove any old [Peer] blocks with the same pubkey
+      - append fresh [Peer] with shared PSK
+      - apply via wg-quick strip + wg syncconf
+      - build client .conf for import (with J*/H* from [Interface])
+    """
+    ip_cidr = _ensure_slash32(ip_cidr)
+    # ensure obf present before appending
+    ensure_interface_obf()
+
+    cli_priv = _require_ok("wg genkey").strip()
+    cli_pub = _require_ok(f'printf %s "{cli_priv}" | wg pubkey').strip()
+
+    _upsert_peer_block_in_file(cli_pub, ip_cidr)
+
+    srv_pub = server_public_key()
+    rows = wg_dump()
+    port = listen_port_from_dump(rows) or 0
+    dns_ip = get_dns_ip()
+    params = read_interface_obf_params()
+    endpoint_host = AWG_CONNECT_HOST
+    endpoint = f"{endpoint_host}:{port}" if endpoint_host else f":{port}"
+
+    # client config
+    lines = [
+        "[Interface]",
+        f"Address = {ip_cidr}",
+        f"DNS = {dns_ip}, 1.0.0.1",
+        f"PrivateKey = {cli_priv}",
+    ]
+    for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
+        if key in params:
+            lines.append(f"{key} = {params[key]}")
+    lines += [
+        "",
+        "[Peer]",
+        f"PublicKey = {srv_pub}",
+        f"PresharedKey = {shared_psk()}",
+        "AllowedIPs = 0.0.0.0/0, ::/0",
+        f"Endpoint = {endpoint}",
+        "PersistentKeepalive = 25",
+        "",
+    ]
+    client_conf = "\n".join(lines)
 
     return {
         "client_private": cli_priv,
@@ -502,6 +569,6 @@ def create_peer_with_generated_keys(ip_cidr: str) -> Dict[str, Any]:
         "assigned_ip": ip_cidr,
         "server_public": srv_pub,
         "listen_port": port,
-        "endpoint": f"{ext_ip}:{port}" if ext_ip else f":{port}",
-        "client_conf": conf_text,
+        "endpoint": endpoint,
+        "client_conf": client_conf,
     }
