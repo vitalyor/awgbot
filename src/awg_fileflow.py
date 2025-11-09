@@ -317,35 +317,51 @@ def _read_conf() -> str:
 
 
 def _write_conf_text_atomic(conf_text: str) -> None:
-    # 1) Validate conf_text before writing
-    if "[Interface]" not in conf_text or len(conf_text) < 40:
-        raise RuntimeError("Refusing to write suspicious conf_text")
+    # 1) Basic sanity on the text we intend to write
+    if "[Interface]" not in conf_text or len(conf_text.strip()) < 40:
+        raise RuntimeError("Refusing to write suspicious conf_text (pre-check)")
 
+    # ensure trailing newline to avoid partial last line truncation issues
+    if not conf_text.endswith("\n"):
+        conf_text = conf_text + "\n"
+
+    # write flow: /tmp/<iface>.conf.b64 -> /tmp/<iface>.conf.tmp -> CONF_PATH
     encoded = base64.b64encode(conf_text.encode("utf-8")).decode("ascii")
-    tmp_b64 = f"/tmp/{WG_IFACE}.conf.b64"
+    tmp_b64   = f"/tmp/{WG_IFACE}.conf.b64"
     tmp_plain = f"/tmp/{WG_IFACE}.conf.tmp"
 
-    # Write base64 payload into a temp file first (no locking needed for /tmp)
-    _require_ok(f"cat > {tmp_b64} <<'B64'\n{encoded}\nB64")
-    # Decode into plain temp file
-    _require_ok(f"base64 -d {tmp_b64} > {tmp_plain}")
+    # create temp payload and decode to a plain file
+    _require_ok(f"set -e; umask 077; cat > {tmp_b64} <<'B64'\n{encoded}\nB64")
+    _require_ok(f"set -e; umask 077; base64 -d {tmp_b64} > {tmp_plain}")
 
-    # Move atomically under a file lock if flock exists
+    # 2) Move atomically under a file lock if flock exists
     rc, _, _ = _sh("command -v flock >/dev/null 2>&1")
     if rc == 0:
         _require_ok(f"flock -x {LOCK_PATH} -c 'mv -f {tmp_plain} {CONF_PATH}; rm -f {tmp_b64}'")
     else:
         _require_ok(f"mv -f {tmp_plain} {CONF_PATH}; rm -f {tmp_b64}")
 
+    # 3) permissions and sync to be extra safe
     _secure_conf_perms()
+    _sh("sync >/dev/null 2>&1 || true")
+    _sh("sleep 0.1 || true")
 
-    # 2) After moving, re-validate the written file
-    try:
-        written = _require_ok(f"cat {CONF_PATH}")
-        if "[Interface]" not in written or len(written.strip()) == 0:
-            raise RuntimeError("Refusing to write suspicious conf_text (post-write)")
-    except Exception:
-        raise RuntimeError("Refusing to write suspicious conf_text (readback fail)")
+    # 4) Re-validate by readback with diagnostics
+    rc, written, err = _sh(f"cat {CONF_PATH} 2>/dev/null || true")
+    if rc != 0 or not written:
+        # print some diag to help debugging
+        sz = _require_ok(f"stat -c %s {CONF_PATH} 2>/dev/null || echo 0").strip()
+        sha = _require_ok(f"sha256sum {CONF_PATH} 2>/dev/null | awk '{{print $1}}' || echo 0").strip()
+        raise RuntimeError(f"Refusing to write suspicious conf_text (readback fail): rc={rc}, size={sz}, sha256={sha}, err={err}")
+
+    # normalize and validate content
+    w = written.strip()
+    if "[Interface]" not in w or len(w) < 40:
+        # include a short head for debugging
+        head = "\n".join(w.splitlines()[:20])
+        raise RuntimeError(f"Refusing to write suspicious conf_text (post-write): HEAD:\n{head}")
+
+    # success
 
 
 def _append_peer_block_in_text(
@@ -438,6 +454,11 @@ def apply_syncconf() -> None:
     """
     _secure_conf_perms()
     _require_ok(f'wg-quick strip "{CONF_PATH}" > /tmp/{WG_IFACE}.stripped')
+    # quick sanity: the stripped file should not be empty and must contain [Interface]
+    rc, stripped, _ = _sh(f"cat /tmp/{WG_IFACE}.stripped 2>/dev/null || true")
+    if rc != 0 or not stripped or "[Interface]" not in stripped:
+        head = "\n".join((stripped or "").splitlines()[:20])
+        raise RuntimeError(f"wg-quick strip produced empty/bad output; HEAD:\n{head}")
     _require_ok(f"wg syncconf {WG_IFACE} /tmp/{WG_IFACE}.stripped")
 
 
