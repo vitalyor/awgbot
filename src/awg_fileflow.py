@@ -285,7 +285,23 @@ def _read_conf() -> str:
 
 def _write_conf_text_atomic(conf_text: str) -> None:
     encoded = base64.b64encode(conf_text.encode("utf-8")).decode("ascii")
-    _with_lock(f"base64 -d > {CONF_PATH} <<'B64'\n{encoded}\nB64")
+    # Write base64 payload into a temp file first (no locking needed for /tmp)
+    tmp_b64 = f"/tmp/{WG_IFACE}.conf.b64"
+    tmp_plain = f"/tmp/{WG_IFACE}.conf.tmp"
+
+    # 1) dump base64 safely via here-doc (no command nesting)
+    _require_ok(f"cat > {tmp_b64} <<'B64'\n{encoded}\nB64")
+    # 2) decode into plain temp file
+    _require_ok(f"base64 -d {tmp_b64} > {tmp_plain}")
+
+    # 3) move atomically under a file lock if flock exists
+    rc, _, _ = _sh("command -v flock >/dev/null 2>&1")
+    if rc == 0:
+        # Use a very simple -c string to avoid quoting pitfalls
+        _require_ok(f"flock -x {LOCK_PATH} -c 'mv -f {tmp_plain} {CONF_PATH}; rm -f {tmp_b64}'")
+    else:
+        _require_ok(f"mv -f {tmp_plain} {CONF_PATH}; rm -f {tmp_b64}")
+
     _secure_conf_perms()
 
 
