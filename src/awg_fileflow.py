@@ -1,6 +1,7 @@
 # src/awg_fileflow.py
 from __future__ import annotations
 from typing import Dict, Any, List, Optional, Tuple
+# read_interface_obf_params() now supports runtime fallback if config file lacks obfuscation keys.
 import ipaddress
 import os
 import base64
@@ -211,65 +212,101 @@ def get_dns_ip() -> str:
 def read_interface_obf_params() -> Dict[str, int]:
     """
     Read Jc/Jmin/Jmax/S1/S2/H1..H4 from [Interface] in wg0.conf (if any).
+    If not found in file, also try runtime `wg show wg0` (which prints them as
+    lowercase keys like `jc:`) and map them back to proper names.
     """
+    want_keys = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
+    file_res: Dict[str, int] = {}
+
+    # 1) From file (case-insensitive)
     try:
         cfg = _require_ok(f"cat {CONF_PATH}")
+        in_iface = False
+        for line in cfg.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if s == "[Interface]":
+                in_iface = True
+                continue
+            if s == "[Peer]":
+                break
+            if in_iface and "=" in s and not s.startswith("#"):
+                k, v = [x.strip() for x in s.split("=", 1)]
+                kl = k.lower()
+                for want in want_keys:
+                    if kl == want.lower():
+                        try:
+                            file_res[want] = int(v)
+                        except Exception:
+                            pass
+                        break
+    except Exception:
+        pass
+
+    if file_res:
+        return file_res
+
+    # 2) Fallback: from runtime `wg show <iface>` (prints as `jc: 2`, etc.)
+    try:
+        out = _require_ok(f"wg show {WG_IFACE} || true")
+        run_res: Dict[str, int] = {}
+        for line in out.splitlines():
+            s = line.strip()
+            if ":" not in s:
+                continue
+            k, v = s.split(":", 1)
+            kl = k.strip().lower()
+            val = v.strip()
+            for want in want_keys:
+                if kl == want.lower():
+                    try:
+                        run_res[want] = int(val)
+                    except Exception:
+                        pass
+                    break
+        return run_res
     except Exception:
         return {}
-    res: Dict[str, int] = {}
-    for line in cfg.splitlines():
-        s = line.strip()
-        if not s or s.startswith("#") or "=" not in s:
-            continue
-        k, v = [x.strip() for x in s.split("=", 1)]
-        if k in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
-            try:
-                res[k] = int(v)
-            except Exception:
-                pass
-    return res
 
 
 def _ensure_interface_has_obf(conf_text: str) -> str:
-    """
-    Ensure [Interface] section contains obfuscation params.
-    - Keep values already present.
-    - If some are missing and an ENV default exists, append it.
-    """
     lines = conf_text.splitlines()
     out: List[str] = []
     in_iface = False
-    seen: Dict[str, bool] = {
-        k: False for k in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
-    }
+    want = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
+    seen: Dict[str, bool] = {k: False for k in want}
 
-    for i, line in enumerate(lines):
+    def append_missing():
+        for key in want:
+            if not seen[key] and ENV_OBF_DEFAULTS.get(key) is not None:
+                out.append(f"{key} = {int(ENV_OBF_DEFAULTS[key])}")
+
+    for line in lines:
         s = line.strip()
         if s == "[Interface]":
             in_iface = True
             out.append(line)
             continue
         if s == "[Peer]":
-            # before leaving the interface block, append missing keys (if we have defaults)
-            for k in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
-                if not seen[k] and ENV_OBF_DEFAULTS.get(k) is not None:
-                    out.append(f"{k} = {int(ENV_OBF_DEFAULTS[k])}")
+            if in_iface:
+                append_missing()
             in_iface = False
             out.append(line)
             continue
 
         if in_iface and "=" in s and not s.startswith("#"):
             k = s.split("=", 1)[0].strip()
-            if k in seen:
-                seen[k] = True
+            kl = k.lower()
+            for key in want:
+                if kl == key.lower():
+                    seen[key] = True
+                    break
 
         out.append(line)
 
-    # If there is no [Peer] at all, ensure we still appended to the end of [Interface]
     if in_iface:
-        for k in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
-            if not seen[k] and ENV_OBF_DEFAULTS.get(k) is not None:
-                out.append(f"{k} = {int(ENV_OBF_DEFAULTS[k])}")
+        append_missing()
 
     return "\n".join(out) + ("\n" if out and out[-1] != "" else "")
 
