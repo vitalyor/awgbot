@@ -448,12 +448,52 @@ def _has_peer_in_text(conf_text: str, pubkey: str) -> bool:
     return False
 
 
+
 def _ensure_slash32(ip_or_cidr: str) -> str:
     ip_or_cidr = ip_or_cidr.strip()
     if "/" not in ip_or_cidr:
         ip_or_cidr = f"{ip_or_cidr}/32"
     _ = ipaddress.ip_interface(ip_or_cidr)  # validate
     return ip_or_cidr
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: synthesize [Interface] from runtime
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _synthesize_interface_from_runtime() -> str:
+    """
+    Build a minimal [Interface] from runtime (wg dump + ip addr) so that we can
+    safely restore a valid config file if it was truncated/empty.
+    Includes obfuscation params from runtime where available.
+    """
+    rows = wg_dump()
+    if not rows:
+        raise RuntimeError("Cannot synthesize interface: wg dump is empty")
+    # wg dump row 0: [0]=private key, [1]=public key, [2]=listen port
+    try:
+        priv = rows[0][0].strip()
+        port = int(rows[0][2])
+    except Exception as e:
+        raise RuntimeError(f"Cannot synthesize interface: bad wg dump header ({e})")
+
+    # detect configured subnet
+    net = server_subnet()  # e.g., IPv4Network('10.8.1.0/24')
+    cidr = str(net)
+
+    # merge obfuscation params from runtime
+    params = read_interface_obf_params()
+
+    lines = [
+        "[Interface]",
+        f"PrivateKey = {priv}",
+        f"Address = {cidr}",
+        f"ListenPort = {port}",
+    ]
+    for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
+        if key in params:
+            lines.append(f"{key} = {params[key]}")
+    lines.append("")  # trailing newline
+    return "\n".join(lines)
 
 
 def apply_syncconf() -> None:
@@ -534,9 +574,16 @@ def alloc_ip_from_runtime() -> str:
 def ensure_interface_obf() -> None:
     """
     Ensure [Interface] section has all obfuscation keys from config and runtime.
-    If missing, append them, write the config, but do not apply.
+    If the cfg file lost its [Interface], synthesize it from runtime and write it back.
     """
     conf = _read_conf()
+
+    # If file lost its [Interface], synthesize from runtime and write immediately
+    if "[Interface]" not in conf:
+        synthesized = _synthesize_interface_from_runtime()
+        _write_conf_text_atomic(synthesized)
+        return
+
     want_keys = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
     # 1) Parse current obf params from file section [Interface] (case-insensitive)
     have = {}
@@ -560,6 +607,7 @@ def ensure_interface_obf() -> None:
                     except Exception:
                         pass
                     break
+
     # 2) Merge with runtime
     merged = read_interface_obf_params()
     # 3) Find missing keys, prepare additions
