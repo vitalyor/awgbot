@@ -1,6 +1,7 @@
 # src/awg_fileflow.py
 from __future__ import annotations
 from typing import Dict, Any, List, Optional, Tuple
+
 # read_interface_obf_params() now supports runtime fallback if config file lacks obfuscation keys.
 import ipaddress
 import os
@@ -318,8 +319,9 @@ def _read_conf() -> str:
 
 def _write_conf_text_atomic(conf_text: str) -> None:
     # 1) Basic sanity on the text we intend to write
-    if "[Interface]" not in conf_text or len(conf_text.strip()) < 40:
-        raise RuntimeError("Refusing to write suspicious conf_text (pre-check)")
+    if "[Interface]" not in conf_text:
+        raise RuntimeError("Refusing to write conf_text without [Interface]")
+    conf_text = conf_text.replace("\r\n", "\n").replace("\r", "\n")
 
     # ensure trailing newline to avoid partial last line truncation issues
     if not conf_text.endswith("\n"):
@@ -327,7 +329,7 @@ def _write_conf_text_atomic(conf_text: str) -> None:
 
     # write flow: /tmp/<iface>.conf.b64 -> /tmp/<iface>.conf.tmp -> CONF_PATH
     encoded = base64.b64encode(conf_text.encode("utf-8")).decode("ascii")
-    tmp_b64   = f"/tmp/{WG_IFACE}.conf.b64"
+    tmp_b64 = f"/tmp/{WG_IFACE}.conf.b64"
     tmp_plain = f"/tmp/{WG_IFACE}.conf.tmp"
 
     # create temp payload and decode to a plain file
@@ -337,7 +339,9 @@ def _write_conf_text_atomic(conf_text: str) -> None:
     # 2) Move atomically under a file lock if flock exists
     rc, _, _ = _sh("command -v flock >/dev/null 2>&1")
     if rc == 0:
-        _require_ok(f"flock -x {LOCK_PATH} -c 'mv -f {tmp_plain} {CONF_PATH}; rm -f {tmp_b64}'")
+        _require_ok(
+            f"flock -x {LOCK_PATH} -c 'mv -f {tmp_plain} {CONF_PATH}; rm -f {tmp_b64}'"
+        )
     else:
         _require_ok(f"mv -f {tmp_plain} {CONF_PATH}; rm -f {tmp_b64}")
 
@@ -351,15 +355,21 @@ def _write_conf_text_atomic(conf_text: str) -> None:
     if rc != 0 or not written:
         # print some diag to help debugging
         sz = _require_ok(f"stat -c %s {CONF_PATH} 2>/dev/null || echo 0").strip()
-        sha = _require_ok(f"sha256sum {CONF_PATH} 2>/dev/null | awk '{{print $1}}' || echo 0").strip()
-        raise RuntimeError(f"Refusing to write suspicious conf_text (readback fail): rc={rc}, size={sz}, sha256={sha}, err={err}")
+        sha = _require_ok(
+            f"sha256sum {CONF_PATH} 2>/dev/null | awk '{{print $1}}' || echo 0"
+        ).strip()
+        raise RuntimeError(
+            f"Refusing to write suspicious conf_text (readback fail): rc={rc}, size={sz}, sha256={sha}, err={err}"
+        )
 
     # normalize and validate content
     w = written.strip()
     if "[Interface]" not in w or len(w) < 40:
         # include a short head for debugging
         head = "\n".join(w.splitlines()[:20])
-        raise RuntimeError(f"Refusing to write suspicious conf_text (post-write): HEAD:\n{head}")
+        raise RuntimeError(
+            f"Refusing to write suspicious conf_text (post-write): HEAD:\n{head}"
+        )
 
     # success
 
@@ -558,7 +568,9 @@ def ensure_interface_obf() -> None:
         return
 
     # Helper: find where to insert lines into [Interface]
-    def insert_into_interface_section(conf_lines: List[str], additions: List[str]) -> List[str]:
+    def insert_into_interface_section(
+        conf_lines: List[str], additions: List[str]
+    ) -> List[str]:
         out = []
         in_iface = False
         inserted = False
