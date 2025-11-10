@@ -81,8 +81,6 @@ def _read_clients_table() -> List[Dict[str, Any]]:
         ai.setdefault("owner_tid", None)
         ai.setdefault("email", ai.get("email"))
         ai.setdefault("created_at", ai.get("created_at") or _now_iso())
-        ai.setdefault("deleted", False)
-        ai.setdefault("deleted_at", None)
         ai.setdefault("source", "bot")
         ai.setdefault("notes", "")
         it["userData"] = ud
@@ -150,7 +148,6 @@ def list_profiles() -> List[dict]:
                 "clientId": cid,
                 "name": ud.get("clientName"),
                 "allowed_ips": allowed,
-                "deleted": bool(ai.get("deleted")),
                 "owner_tid": ai.get("owner_tid"),
                 "userData": ud,
                 "addInfo": ai,
@@ -213,8 +210,6 @@ def _name_in_use_for_owner(owner_tid: int, name: str) -> bool:
     name_norm = " ".join(name.split()).lower()
     for p in list_profiles():
         if p.get("owner_tid") != owner_tid:
-            continue
-        if p.get("deleted"):
             continue
         # AWG-репозиторий проверяет только AWG-профили (этот файл)
         pname = (p.get("name") or "").strip().lower()
@@ -308,10 +303,8 @@ def _sync_wg_conf_from_table() -> None:
             break
         conf_lines.append(line)
 
-    # добавляем живые peers
+    # добавляем живые peers (без фильтрации по deleted)
     for client in clients:
-        if client.get("addInfo", {}).get("deleted"):
-            continue
         ud = client.get("userData", {}) or {}
         cid = client.get("clientId")
         ip = ud.get("ip")
@@ -365,8 +358,6 @@ def create_profile(profile_data: dict) -> str:
     add_info = {
         "uuid": client_uuid,
         "owner_tid": profile_data.get("owner_tid"),
-        "deleted": False,
-        "deleted_at": None,
         "created_at": _now_iso(),
         "type": "awg",
         "email": _safe_email,
@@ -388,17 +379,17 @@ def find_profile_by_uuid(uuid: str) -> Optional[dict]:
 
 
 def delete_profile_by_uuid(uuid: str) -> bool:
-    """Помечает профиль как удалённый и пересобирает wg0.conf."""
+    """Удаляет профиль из clientsTable по UUID и пересобирает wg0.conf."""
     items = _read_clients_table()
+    new_items = []
     changed = False
     for it in items:
         ai = it.get("addInfo", {}) or {}
-        if ai.get("uuid") == uuid and not ai.get("deleted"):
-            ai["deleted"] = True
-            ai["deleted_at"] = _now_iso()
-            it["addInfo"] = ai
+        if ai.get("uuid") == uuid:
             changed = True
+            continue
+        new_items.append(it)
     if changed:
-        _write_clients_table(items)
+        _write_clients_table(new_items)
         _sync_wg_conf_from_table()
     return changed

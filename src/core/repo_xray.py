@@ -242,27 +242,30 @@ def add_user(tg_id: int, name: str) -> Dict[str, Any]:
 
 
 def remove_user_by_name(tg_id: int, name: str) -> bool:
-    """Логическое удаление пользователя по имени (soft-delete)."""
+    """Полное удаление записи XRAY из clientsTable по имени и owner_tid.
+    Раньше было soft-delete (deleted=true), теперь — жёсткое удаление.
+    Возвращает True, если хотя бы одна запись была удалена.
+    """
     raw = _read_json_from_container(CLIENTS_TABLE)
     items = _normalize_to_list(raw, "xray")
 
-    changed = False
+    name = (name or "").strip()
+    if not name:
+        return False
+
+    before = len(items)
+    kept: List[Dict[str, Any]] = []
     for it in items:
         ud = it.get("userData", {}) or {}
         ai = it.get("addInfo", {}) or {}
-        if (
-            ai.get("owner_tid") == tg_id
-            and ud.get("clientName") == name
-            and not ai.get("deleted")
-        ):
-            ai["deleted"] = True
-            ai["deleted_at"] = _now_iso()
-            it["addInfo"] = ai
-            changed = True
+        # сохраняем только те, кто НЕ совпадает с (owner_tid, name)
+        if not (ai.get("owner_tid") == tg_id and (ud.get("clientName") or "").strip() == name):
+            kept.append(it)
 
-    if changed:
-        _write_json_list(CLIENTS_TABLE, items)
-    return changed
+    if len(kept) != before:
+        _write_json_list(CLIENTS_TABLE, kept)
+        return True
+    return False
 
 
 # ===== совместимость с интерфейсом бота =====
@@ -289,19 +292,23 @@ def create_profile(d: dict) -> str:
 
 
 def delete_profile_by_uuid(uuid_str: str) -> bool:
-    """
-    XRAY — софт-делит по UUID (для единообразия API с AWG).
+    """Полное удаление XRAY-профиля по UUID/ClientId из clientsTable.
+    Совместимость с интерфейсом бота: возвращает True, если удалили хотя бы одну запись.
     """
     raw = _read_json_from_container(CLIENTS_TABLE)
     items = _normalize_to_list(raw, "xray")
-    changed = False
+
+    before = len(items)
+    kept: List[Dict[str, Any]] = []
     for it in items:
         ai = it.get("addInfo", {}) or {}
-        if (ai.get("uuid") or it.get("clientId")) == uuid_str and not ai.get("deleted"):
-            ai["deleted"] = True
-            ai["deleted_at"] = _now_iso()
-            it["addInfo"] = ai
-            changed = True
-    if changed:
-        _write_json_list(CLIENTS_TABLE, items)
-    return changed
+        cid = it.get("clientId")
+        # считаем совпадением либо addInfo.uuid, либо сам clientId
+        if (ai.get("uuid") == uuid_str) or (cid == uuid_str):
+            continue  # удаляем
+        kept.append(it)
+
+    if len(kept) != before:
+        _write_json_list(CLIENTS_TABLE, kept)
+        return True
+    return False
