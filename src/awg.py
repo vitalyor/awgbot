@@ -7,6 +7,8 @@ import ipaddress
 import os
 import base64
 import re
+import json
+from datetime import datetime, timezone
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Imports that work both when this file is imported as a top-level module
@@ -89,6 +91,7 @@ else:
 PSK_PATH = f"{CONF_DIR}/wireguard_psk.key"
 SERVER_PUB = f"{CONF_DIR}/wireguard_server_public_key.key"
 LOCK_PATH = f"{CONF_DIR}/.conf.lock"
+CLIENTS_TABLE = f"{CONF_DIR}/clientsTable"
 
 # Default (fallback) obfuscation values (used if not present in file).
 # If you want to force specific values, set these ENV vars in the AWG container.
@@ -155,6 +158,15 @@ def _docker_cp_local_to_container(local_path: str, container_dst: str) -> None:
     )
     if rc != 0:
         raise RuntimeError(f"docker cp failed: rc={rc}\n{err}")
+
+def _write_text_into_container(container_path: str, text: str) -> None:
+    """Write text content to a file inside the AWG container using docker cp."""
+    tmp_dir = "/app/data/tmp"
+    _ensure_dir(tmp_dir)
+    local_tmp = os.path.join(tmp_dir, os.path.basename(container_path) + ".new")
+    with open(local_tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    _docker_cp_local_to_container(local_tmp, container_path)
 
 
 def _with_lock(cmd: str) -> str:
@@ -582,6 +594,57 @@ def _ensure_slash32(ip_or_cidr: str) -> str:
         raise ValueError("Client IP must be /32")
     return str(iface)
 
+def _append_clients_table_entry(
+    client_pub: str,
+    client_name: str,
+    email: str = "",
+    uuid: str = "",
+    created_at_iso: Optional[str] = None,
+    deleted: bool = False,
+    deleted_at: Optional[str] = None,
+) -> None:
+    """Append a client record to CLIENTS_TABLE. If file is missing/malformed, create a new JSON array.
+    Structure:
+      {
+        "clientId": <client public key>,
+        "userData": {"clientName": ..., "creationDate": <RFC822-like>},
+        "addInfo": {"email": ..., "uuid": ..., "created_at": <ISO8601>, "deleted": bool, "deleted_at": str|None}
+      }
+    """
+    try:
+        raw = _require_ok(f"cat {CLIENTS_TABLE} 2>/dev/null || true", timeout=5)
+        data = json.loads(raw) if raw.strip() else []
+        if not isinstance(data, list):
+            data = []
+    except Exception:
+        data = []
+
+    # idempotent by clientId
+    for it in data:
+        if isinstance(it, dict) and it.get("clientId") == client_pub:
+            return
+
+    rfc = datetime.now().ctime()  # Mon Nov 10 08:35:32 2025
+    iso = created_at_iso or datetime.now(timezone.utc).isoformat()
+
+    rec = {
+        "clientId": client_pub,
+        "userData": {
+            "clientName": client_name,
+            "creationDate": rfc,
+        },
+        "addInfo": {
+            "email": email,
+            "uuid": uuid,
+            "created_at": iso,
+            "deleted": bool(deleted),
+            "deleted_at": deleted_at,
+        },
+    }
+
+    text = json.dumps(data + [rec], ensure_ascii=False, indent=4) + "\n"
+    _write_text_into_container(CLIENTS_TABLE, text)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper: synthesize [Interface] from runtime
@@ -729,10 +792,10 @@ def add_peer_with_pubkey_auto(cli_pub: str) -> Dict[str, Any]:
     }
 
 
-def create_peer_with_generated_keys_auto() -> Dict[str, Any]:
+def create_peer_with_generated_keys_auto(meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Generate keys and allocate a free /32 automatically. Returns full summary including client config."""
     ip_cidr = alloc_ip_from_runtime()
-    return create_peer_with_generated_keys(ip_cidr)
+    return create_peer_with_generated_keys(ip_cidr, meta=meta)
 
 
 def ensure_interface_obf() -> None:
@@ -970,7 +1033,7 @@ def make_client_conf_text(cli_priv: str, assigned_ip: str) -> str:
     return "\n".join(lines)
 
 
-def create_peer_with_generated_keys(ip_cidr: str) -> Dict[str, Any]:
+def create_peer_with_generated_keys(ip_cidr: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     ip_cidr = _ensure_slash32(ip_cidr)
     ensure_interface_obf()
 
@@ -980,6 +1043,26 @@ def create_peer_with_generated_keys(ip_cidr: str) -> Dict[str, Any]:
     _upsert_peer_block_in_file(cli_pub, ip_cidr)
 
     client_conf = make_client_conf_text(cli_priv, ip_cidr)
+
+        # Record into clientsTable with extended metadata (non-fatal on error)
+    client_name = (meta or {}).get("clientName") or (meta or {}).get("name") or ip_cidr
+    email = (meta or {}).get("email", "")
+    uuid = (meta or {}).get("uuid", "")
+    created_at = (meta or {}).get("created_at")
+    deleted_flag = bool((meta or {}).get("deleted", False))
+    deleted_at = (meta or {}).get("deleted_at")
+    try:
+        _append_clients_table_entry(
+            cli_pub,
+            client_name=client_name,
+            email=email,
+            uuid=uuid,
+            created_at_iso=created_at,
+            deleted=deleted_flag,
+            deleted_at=deleted_at,
+        )
+    except Exception:
+        pass
 
     rows = wg_dump()
     port = listen_port_from_dump(rows) or 0
