@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import ipaddress
 import os
 import base64
+import re
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Imports that work both when this file is imported as a top-level module
@@ -25,6 +26,9 @@ except Exception:
 # Paths & constants (compatible with your stack)
 # ─────────────────────────────────────────────────────────────────────────────
 AWG_CONTAINER = os.getenv("AWG_CONTAINER", "amnezia-awg")
+
+# Allow explicit DNS override for amnezia-dns detection
+AWG_DNS_IP_OVERRIDE = os.getenv("AWG_DNS_IP", "").strip()
 
 # Prefer explicit config path from env, otherwise fall back to default layout
 CONF_PATH_ENV = os.getenv("AWG_CONFIG_PATH")
@@ -256,16 +260,34 @@ def shared_psk() -> str:
     return _require_ok(f"cat {PSK_PATH}").strip()
 
 
+
+_IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+
 def get_dns_ip() -> str:
-    """Return amnezia-dns IP if available (inside AWG container), otherwise 1.1.1.1."""
+    """Return amnezia-dns IPv4 if available (inside AWG container), else fallback to 1.1.1.1.
+    Order: explicit override env → ahostsv4 → hosts → fallback.
+    """
+    if AWG_DNS_IP_OVERRIDE and _IPV4_RE.match(AWG_DNS_IP_OVERRIDE):
+        return AWG_DNS_IP_OVERRIDE
+
+    # Try glibc ahostsv4 (first IPv4)
     try:
-        # Use POSIX set -- to split by IFS and read first field (IP)
-        rc, out, _ = _sh("set -- $(getent hosts amnezia-dns 2>/dev/null); [ -n \"$1\" ] && echo $1 || true", timeout=5)
+        rc, out, _ = _sh("getent ahostsv4 amnezia-dns 2>/dev/null | awk 'NR==1{print $1}' || true", timeout=5)
         ip = (out or "").strip()
-        if ip and ip.count(".") == 3:
+        if _IPV4_RE.match(ip):
             return ip
     except Exception:
         pass
+
+    # Fallback: classic hosts db
+    try:
+        rc, out, _ = _sh("getent hosts amnezia-dns 2>/dev/null | awk 'NR==1{print $1}' || true", timeout=5)
+        ip = (out or "").strip()
+        if _IPV4_RE.match(ip):
+            return ip
+    except Exception:
+        pass
+
     return "1.1.1.1"
 
 
