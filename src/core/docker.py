@@ -2,6 +2,9 @@ from __future__ import annotations
 import os, shlex, subprocess
 from pathlib import Path
 
+from services.logger_setup import get_logger
+log = get_logger("core.docker")
+
 # Белый список контейнеров, в которые разрешаем docker exec
 ALLOWED_CONTAINERS = {
     os.getenv("AWG_CONTAINER", "amnezia-awg"),
@@ -15,6 +18,7 @@ def run_cmd(cmd: str, timeout: int = 6):
     Выполняет shell-команду. Возвращает (rc, stdout, stderr).
     Не бросает исключения.
     """
+    log.debug(f"Running cmd: {cmd}")
     try:
         p = subprocess.run(
             cmd,
@@ -24,9 +28,13 @@ def run_cmd(cmd: str, timeout: int = 6):
             text=True,
             timeout=timeout,
         )
-        return p.returncode, p.stdout.strip(), p.stderr.strip()
+        rc, stdout, stderr = p.returncode, p.stdout.strip(), p.stderr.strip()
+        log.debug(f"rc={rc}, stdout={stdout[:100]!r}, stderr={stderr[:100]!r}")
+        return rc, stdout, stderr
     except Exception as e:
-        return 999, "", str(e)
+        rc, stdout, stderr = 999, "", str(e)
+        log.debug(f"rc={rc}, stdout={stdout[:100]!r}, stderr={stderr[:100]!r}")
+        return rc, stdout, stderr
 
 def dir_size_bytes(path: str) -> int:
     try:
@@ -57,4 +65,7 @@ def _docker_exec(container: str, cmd: str, timeout: int = 6):
     if container not in ALLOWED_CONTAINERS:
         return 998, "", f"container {container} not allowed"
     safe = f"docker exec {shlex.quote(container)} sh -lc {shlex.quote(cmd)}"
-    return run_cmd(safe, timeout=timeout)
+    log.debug(f"Running cmd: {safe}")
+    rc, stdout, stderr = run_cmd(safe, timeout=timeout)
+    log.debug(f"rc={rc}, stdout={stdout[:100]!r}, stderr={stderr[:100]!r}")
+    return rc, stdout, stderr

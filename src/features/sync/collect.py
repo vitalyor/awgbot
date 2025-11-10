@@ -4,12 +4,14 @@ from typing import Dict, Any, List
 import logging
 
 from core.state import load_state
-import xray as XR
+from core import repo_xray as XR
 
 logger = logging.getLogger(__name__)
 
+
 def profiles_active(user: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [p for p in user.get("profiles", []) if not p.get("deleted")]
+
 
 def sync_collect():
     """
@@ -57,7 +59,11 @@ def sync_collect():
                 if st_flow and xr_flow and st_flow != xr_flow:
                     diffs.append("flow")
                 (diverged if diffs else active).append(
-                    {"tid": tid, "name": p["name"], **({"diffs": diffs} if diffs else {})}
+                    {
+                        "tid": tid,
+                        "name": p["name"],
+                        **({"diffs": diffs} if diffs else {}),
+                    }
                 )
             elif present and is_susp:
                 suspended.append({"tid": tid, "name": p["name"]})

@@ -5,12 +5,12 @@ from datetime import datetime, UTC
 from pathlib import Path
 from typing import Dict, Any
 
-from logger_setup import get_logger
+from services.logger_setup import get_logger
 
 from core.repo_awg import list_profiles as awg_list_profiles
 from core.repo_xray import list_profiles as xray_list_profiles
 
-logger = get_logger()
+logger = get_logger("core.state")
 
 # Пути и лимиты (как было в bot.py)
 DATA_DIR = "/app/data"
@@ -159,7 +159,6 @@ def load_state() -> Dict[str, Any]:
     # нормализация
     users = st.setdefault("users", {})
     changed = False
-    from .state import now_iso as _now  # локальный импорт, чтобы избежать циклов
 
     for tid, rec in list(users.items()):
         if not isinstance(rec, dict):
@@ -167,7 +166,7 @@ def load_state() -> Dict[str, Any]:
                 "allowed": False,
                 "username": "",
                 "first_name": "",
-                "created_at": _now(),
+                "created_at": now_iso(),
             }
             changed = True
             continue
@@ -181,7 +180,7 @@ def load_state() -> Dict[str, Any]:
             rec["first_name"] = ""
             changed = True
         if "created_at" not in rec:
-            rec["created_at"] = _now()
+            rec["created_at"] = now_iso()
             changed = True
     if changed:
         save_state(st)
@@ -224,7 +223,11 @@ def get_user_profiles(user_id: int) -> list[dict]:
     awg_profiles = awg_list_profiles()
     xray_profiles = xray_list_profiles()
     combined = awg_profiles + xray_profiles
-    filtered = [p for p in combined if getattr(p, "addInfo", None) and getattr(p.addInfo, "owner_tid", None) == user_id]
+    filtered = []
+    for p in combined:
+        add = p.get("addInfo") or {}
+        if add.get("owner_tid") == user_id:
+            filtered.append(p)
     return filtered
 
 
