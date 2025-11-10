@@ -30,17 +30,44 @@ AWG_CONTAINER = os.getenv("AWG_CONTAINER", "amnezia-awg")
 CONF_PATH_ENV = os.getenv("AWG_CONFIG_PATH")
 DEFAULT_IFACE = "wg0"
 
-# Determine interface name
+# Try to detect interface name from runtime first
+
+def _detect_iface_from_runtime() -> Optional[str]:
+    # 1) wg show interfaces
+    try:
+        rc, out, _ = _sh("wg show interfaces 2>/dev/null || true", timeout=5)
+        cand = (out or "").strip().split()
+        if cand:
+            # If multiple, take the first (primary)
+            return cand[0]
+    except Exception:
+        pass
+    # 2) ip -o link show type wireguard
+    try:
+        rc, out, _ = _sh("ip -o link show type wireguard 2>/dev/null || true", timeout=5)
+        for line in (out or "").splitlines():
+            # format: "7: wg0: <...>"
+            parts = line.split(":", 2)
+            if len(parts) >= 2:
+                name = parts[1].strip()
+                if name:
+                    return name
+    except Exception:
+        pass
+    return None
+
+# Determine interface name (prefer runtime detection)
+runtime_iface = _detect_iface_from_runtime()
 _env_iface = (os.getenv("AWG_IFACE", "").strip() or None)
-if _env_iface and _env_iface.lower() != "none":
+if runtime_iface:
+    _iface_detected = runtime_iface
+elif _env_iface and _env_iface.lower() != "none":
     _iface_detected = _env_iface
+elif CONF_PATH_ENV:
+    _base = os.path.basename(CONF_PATH_ENV)
+    _iface_detected = _base.split(".")[0] if _base else DEFAULT_IFACE
 else:
-    # If config path is given, derive iface from its basename (e.g., wg0.conf → wg0)
-    if CONF_PATH_ENV:
-        _base = os.path.basename(CONF_PATH_ENV)
-        _iface_detected = _base.split(".")[0] if _base else DEFAULT_IFACE
-    else:
-        _iface_detected = DEFAULT_IFACE
+    _iface_detected = DEFAULT_IFACE
 
 WG_IFACE = _iface_detected
 
@@ -622,6 +649,43 @@ def alloc_ip_from_runtime() -> str:
     return f"{ip}/32"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-allocation public helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def next_free_ip() -> str:
+    """Return next available /32 as string, e.g. '10.8.1.23/32'."""
+    return alloc_ip_from_runtime()
+
+
+def add_peer_with_pubkey_auto(cli_pub: str) -> Dict[str, Any]:
+    """Allocate a free /32 and add peer for the given public key. Returns summary.
+    """
+    ip_cidr = alloc_ip_from_runtime()
+    _upsert_peer_block_in_file(cli_pub, ip_cidr)
+    rows = wg_dump()
+    port = listen_port_from_dump(rows) or 0
+    endpoint_host = _detect_external_host_fallback() or AWG_CONNECT_HOST
+    if not endpoint_host:
+        raise RuntimeError(
+            "Cannot determine endpoint host (runtime detect failed and AWG_CONNECT_HOST is empty)"
+        )
+    endpoint = f"{endpoint_host}:{port}"
+    return {
+        "assigned_ip": ip_cidr,
+        "server_public": server_public_key(),
+        "listen_port": port,
+        "endpoint": endpoint,
+    }
+
+
+def create_peer_with_generated_keys_auto() -> Dict[str, Any]:
+    """Generate keys and allocate a free /32 automatically. Returns full summary including client config.
+    """
+    ip_cidr = alloc_ip_from_runtime()
+    return create_peer_with_generated_keys(ip_cidr)
+
+
 def ensure_interface_obf() -> None:
     """
     Ensure [Interface] section has all obfuscation keys from config and runtime.
@@ -728,7 +792,12 @@ def make_client_conf_text(cli_priv: str, assigned_ip: str) -> str:
     assigned_ip = _ensure_slash32(assigned_ip)
     srv_pub = server_public_key()
     port = listen_port_from_dump(wg_dump()) or 0
-    dns_ip = get_dns_ip()
+    dns_ip = get_dns_ip()  # single IP or "1.1.1.1"
+    # Build DNS list: prefer internal amnezia-dns IP if available, then CF pair
+    if dns_ip == "1.1.1.1":
+        dns_list = ["1.0.0.1", "1.1.1.1"]
+    else:
+        dns_list = [dns_ip, "1.0.0.1", "1.1.1.1"]
     params = read_interface_obf_params()
     endpoint_host = _detect_external_host_fallback() or AWG_CONNECT_HOST
     if not endpoint_host:
@@ -738,7 +807,7 @@ def make_client_conf_text(cli_priv: str, assigned_ip: str) -> str:
     lines = [
         "[Interface]",
         f"Address = {assigned_ip}",
-        f"DNS = {dns_ip}, 1.0.0.1",
+        f"DNS = {', '.join(dns_list)}",
         f"PrivateKey = {cli_priv}",
     ]
     for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"):
