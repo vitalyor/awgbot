@@ -13,11 +13,12 @@ from services.util import (
     docker_read_file,
     docker_write_file_atomic,
     XRAY_CONTAINER,
-    XRAY_SERVER_JSON,
 )
 
 log = get_logger("core.repo_xray")
 
+# Локальные константы путей внутри контейнера XRAY
+XRAY_SERVER_JSON = "/opt/amnezia/xray/server.json"
 CLIENTS_TABLE = "/opt/amnezia/xray/clientsTable"
 
 
@@ -164,8 +165,7 @@ def add_user(tg_id: int, name: str) -> Dict[str, Any]:
             "owner_tid": int(tg_id),
             "email": f"{int(tg_id)}-{(name or '').strip().replace(' ', '_')}",
             "created_at": _now_iso(),
-            "deleted": False,  # поле оставляем для совместимости, но больше не используем
-            "deleted_at": None,  # см. ниже — удаляем физически
+            # Полей deleted/deleted_at больше не используем — храним только живые записи.
             "source": "bot",
             "notes": "",
         },
@@ -223,7 +223,7 @@ def create_profile(d: dict) -> str:
 
 
 def delete_profile_by_uuid(_uuid: str) -> bool:
-    # XRay: удаление по имени удобнее, но поддержим по uuid
+    # Удаление по uuid
     items = _read_clients_table()
     new_items = []
     changed = False
@@ -255,13 +255,7 @@ def render_client_config(uuid: str) -> str:
         "protocol": "vless",
         "uuid": cid,
         "email": email,
-        "server": {
-            "host": "<SERVER_HOST>",  # заполни ботом/оператором
-            "port": port or 443,
-        },
-        "transport": {
-            "type": "tcp",  # при желании можно читать из server.json
-            "security": "tls",
-        },
+        "server": {"host": "<SERVER_HOST>", "port": port or 443},
+        "transport": {"type": "tcp", "security": "tls"},
     }
     return json.dumps(obj, ensure_ascii=False, indent=2) + "\n"
