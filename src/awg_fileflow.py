@@ -264,24 +264,34 @@ def shared_psk() -> str:
 _IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 
 def get_dns_ip() -> str:
-    """Return amnezia-dns IPv4 if available (inside AWG container), else fallback to 1.1.1.1.
-    Order: explicit override env → ahostsv4 → hosts → fallback.
+    """
+    Return amnezia-dns IPv4 if available (inside AWG container), else fallback to 1.1.1.1.
+    Order: explicit override env → ahostsv4 → hosts → BusyBox ping → fallback.
     """
     if AWG_DNS_IP_OVERRIDE and _IPV4_RE.match(AWG_DNS_IP_OVERRIDE):
         return AWG_DNS_IP_OVERRIDE
 
-    # Try glibc ahostsv4 (first IPv4)
+    # 1) glibc: ahostsv4
     try:
-        rc, out, _ = _sh("getent ahostsv4 amnezia-dns 2>/dev/null | awk 'NR==1{print $1}' || true", timeout=5)
+        rc, out, _ = _sh("getent ahostsv4 amnezia-dns 2>/dev/null | awk 'NR==1{print $1}' || true", timeout=3)
         ip = (out or "").strip()
         if _IPV4_RE.match(ip):
             return ip
     except Exception:
         pass
 
-    # Fallback: classic hosts db
+    # 2) classic hosts
     try:
-        rc, out, _ = _sh("getent hosts amnezia-dns 2>/dev/null | awk 'NR==1{print $1}' || true", timeout=5)
+        rc, out, _ = _sh("getent hosts amnezia-dns 2>/dev/null | awk 'NR==1{print $1}' || true", timeout=3)
+        ip = (out or "").strip()
+        if _IPV4_RE.match(ip):
+            return ip
+    except Exception:
+        pass
+
+    # 3) BusyBox ping output: PING amnezia-dns (172.x.x.x)
+    try:
+        rc, out, _ = _sh("ping -c1 -W1 amnezia-dns 2>/dev/null | awk -F'[()]' 'NR==1{print $2; exit}' || true", timeout=3)
         ip = (out or "").strip()
         if _IPV4_RE.match(ip):
             return ip
