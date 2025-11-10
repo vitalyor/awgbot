@@ -968,7 +968,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "my_profiles":
-        active = profiles_active(user)
+        # Stage 0 freeze: профилей в state.json больше нет; список будет из clientsTable на следующем этапе
+        active = []
         if not active:
             empty_kb = InlineKeyboardMarkup(
                 [
@@ -1266,18 +1267,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ok = False
         except Exception:
             ok = False
-        st = load_state()
-        user = ensure_user_bucket(st, u.id, u.username or "", u.first_name or "")
-        for p in user.get("profiles", []):
-            if (
-                p.get("name") == pname
-                and p.get("type") == ptype
-                and not p.get("deleted")
-            ):
-                p["deleted"] = True
-                p["deleted_at"] = now_iso()
-                break
-        save_state(st)
         txt = (
             "Конфигурация удалена ✅"
             if ok
@@ -1778,18 +1767,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
         except Exception:
             pass
-        st = load_state()
-        urec = st["users"].get(tid, {})
-        for p in urec.get("profiles", []):
-            if (
-                p.get("name") == pname
-                and p.get("type") == ptype
-                and not p.get("deleted")
-            ):
-                p["deleted"] = True
-                p["deleted_at"] = now_iso()
-                break
-        save_state(st)
         await show_admin_user_profiles(
             update, context, tid, note="Конфигурация удалена."
         )
@@ -2166,17 +2143,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             if typ == "xray":
+                # Stage 0 freeze: создаём в Xray, но НЕ пишем профили в state.json
                 created = XR.add_user(u.id, name)
-                user["profiles"].append(
-                    {
-                        "name": name,
-                        "type": "xray",
-                        "email": created["email"],
-                        "uuid": created["uuid"],
-                        "created_at": now_iso(),
-                    }
-                )
-                save_state(st)
                 try:
                     await update.message.delete()
                 except Exception:
@@ -2204,20 +2172,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "pubkey": res.get("client_public", ""),
                     "uuid": prof_uuid,
                 }
-                user["profiles"].append(
-                    {
-                        "name": name,
-                        "type": "amneziawg",
-                        "email": created["email"],
-                        "vpn_url": created.get("vpn_url", ""),
-                        "endpoint": created.get("endpoint", ""),
-                        "assigned_ip": created.get("assigned_ip", ""),
-                        "pubkey": created.get("pubkey", ""),
-                        "uuid": prof_uuid,
-                        "created_at": meta["created_at"],
-                    }
-                )
-                save_state(st)
+                # Stage 0 freeze: не пишем профили в state.json
                 kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="menu")]])
                 try:
                     await update.message.delete()
