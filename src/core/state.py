@@ -7,6 +7,9 @@ from typing import Dict, Any
 
 from logger_setup import get_logger
 
+from core.repo_awg import list_profiles as awg_list_profiles
+from core.repo_xray import list_profiles as xray_list_profiles
+
 logger = get_logger()
 
 # Пути и лимиты (как было в bot.py)
@@ -143,6 +146,10 @@ def save_state(st: Dict[str, Any]) -> None:
 
 
 def load_state() -> Dict[str, Any]:
+    """
+    Загружает состояние из state.json.
+    Теперь state.json хранит только пользователей (без профилей).
+    """
     if not os.path.isdir(DATA_DIR):
         os.makedirs(DATA_DIR, exist_ok=True)
     if not os.path.exists(STATE_PATH):
@@ -160,16 +167,12 @@ def load_state() -> Dict[str, Any]:
                 "allowed": False,
                 "username": "",
                 "first_name": "",
-                "profiles": [],
                 "created_at": _now(),
             }
             changed = True
             continue
         if "allowed" not in rec:
             rec["allowed"] = False
-            changed = True
-        if "profiles" not in rec or not isinstance(rec.get("profiles"), list):
-            rec["profiles"] = []
             changed = True
         if "username" not in rec:
             rec["username"] = ""
@@ -188,20 +191,21 @@ def load_state() -> Dict[str, Any]:
 def ensure_user_bucket(
     st: Dict[str, Any], tg_id: int, username: str, first_name: str
 ) -> Dict[str, Any]:
+    """
+    Обеспечивает наличие записи пользователя в состоянии.
+    Теперь не содержит логику по профилям.
+    """
     u = st["users"].setdefault(
         str(tg_id),
         {
             "allowed": False,
             "username": username or "",
             "first_name": first_name or "",
-            "profiles": [],
             "created_at": now_iso(),
         },
     )
     if "allowed" not in u:
         u["allowed"] = False
-    if "profiles" not in u or not isinstance(u.get("profiles"), list):
-        u["profiles"] = []
     if "created_at" not in u:
         u["created_at"] = now_iso()
     if username:
@@ -209,3 +213,24 @@ def ensure_user_bucket(
     if first_name:
         u["first_name"] = first_name
     return u
+
+
+def get_user_profiles(user_id: int) -> list[dict]:
+    """
+    Возвращает список профилей пользователя user_id,
+    объединяя профили из репозиториев awg и xray.
+    Фильтрует по addInfo.owner_tid == user_id.
+    """
+    awg_profiles = awg_list_profiles()
+    xray_profiles = xray_list_profiles()
+    combined = awg_profiles + xray_profiles
+    filtered = [p for p in combined if getattr(p, "addInfo", None) and getattr(p.addInfo, "owner_tid", None) == user_id]
+    return filtered
+
+
+def sync_user_profiles(user_id: int) -> dict:
+    """
+    Возвращает объект с user_id и списком профилей пользователя.
+    """
+    profiles = get_user_profiles(user_id)
+    return {"user_id": user_id, "profiles": profiles}
