@@ -820,6 +820,63 @@ def remove_peer(pubkey: str) -> None:
     _write_conf_text_atomic(conf2)
 
 
+def remove_peer_by_ip(ip_or_cidr: str) -> Dict[str, Any]:
+    """
+    Remove peer(s) whose AllowedIPs exactly match the given IP (normalized to /32).
+    Returns a summary with count and removed pubkeys. Raises KeyError if nothing matched.
+    """
+    target = _ensure_slash32(ip_or_cidr)
+    conf = _read_conf()
+
+    lines = conf.splitlines()
+    new_lines: List[str] = []
+    i = 0
+    removed_pub: List[str] = []
+
+    while i < len(lines):
+        if lines[i].strip() == "[Peer]":
+            j = i + 1
+            buf = [lines[i]]
+            pub = None
+            allowed = None
+            # capture this peer block
+            while j < len(lines) and lines[j].strip() != "[Peer]":
+                s = lines[j].strip()
+                if s.startswith("PublicKey") and "=" in s:
+                    _, v = s.split("=", 1)
+                    pub = v.strip()
+                if s.startswith("AllowedIPs") and "=" in s:
+                    _, v = s.split("=", 1)
+                    allowed = v.strip()
+                buf.append(lines[j])
+                j += 1
+
+            if allowed == target:
+                # drop this block
+                if pub:
+                    removed_pub.append(pub)
+                # do not append buf to new_lines
+            else:
+                # keep this block
+                new_lines.extend(buf)
+            i = j
+            continue
+        else:
+            new_lines.append(lines[i])
+            i += 1
+
+    if not removed_pub:
+        raise KeyError(f"No peer with AllowedIPs = {target}")
+
+    # preserve interface and apply
+    new_conf = "\n".join(new_lines)
+    if new_conf and not new_conf.endswith("\n"):
+        new_conf += "\n"
+    _write_conf_text_atomic(new_conf)
+
+    return {"removed_count": len(removed_pub), "removed_pubkeys": removed_pub, "ip": target}
+
+
 def clean_all_peers() -> None:
     """
     Keep only [Interface] in the file, preserving/adding obfuscation, then apply.
