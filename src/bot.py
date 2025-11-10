@@ -2184,14 +2184,25 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_app_picker(update, context, name, for_edit=True)
 
             elif typ in ("amneziawg", "awg"):
-                # Создаём peer с авто-IP через awg.py (куда ты перенёс awg_fileflow)
-                res = AWG.create_peer_with_generated_keys_auto()
+                # Создаём peer с авто-IP и одновременно фиксируем запись в clientsTable через meta
+                prof_uuid = str(uuid.uuid4())
+                email = f"{u.id}.{name}@bot"
+                meta = {
+                    "clientName": name,
+                    "email": email,
+                    "uuid": prof_uuid,
+                    "created_at": now_iso(),
+                    "deleted": False,
+                    "deleted_at": None,
+                }
+                res = AWG.create_peer_with_generated_keys_auto(meta=meta)
                 created = {
-                    "email": f"{u.id}.{name}@bot",
-                    "vpn_url": res.get("client_conf", ""),   # это текст .conf для импорта в Amnezia
+                    "email": email,
+                    "vpn_url": res.get("client_conf", ""),  # это текст .conf для импорта в Amnezia
                     "endpoint": res.get("endpoint", ""),
                     "assigned_ip": res.get("assigned_ip", ""),
                     "pubkey": res.get("client_public", ""),
+                    "uuid": prof_uuid,
                 }
                 user["profiles"].append(
                     {
@@ -2201,7 +2212,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "vpn_url": created.get("vpn_url", ""),
                         "endpoint": created.get("endpoint", ""),
                         "assigned_ip": created.get("assigned_ip", ""),
-                        "created_at": now_iso(),
+                        "pubkey": created.get("pubkey", ""),
+                        "uuid": prof_uuid,
+                        "created_at": meta["created_at"],
                     }
                 )
                 save_state(st)
