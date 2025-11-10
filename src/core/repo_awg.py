@@ -5,7 +5,7 @@
 from __future__ import annotations
 import json
 import ipaddress
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timezone
 
 from services.logger_setup import get_logger
@@ -49,10 +49,15 @@ def _write_json_to_container(path: str, data: Any) -> None:
 
 
 def _wg_dump() -> List[str]:
-    # Use shell to ensure PATH is correct inside container
-    rc, out, err = docker_exec(AWG_CONTAINER, ["sh", "-lc", "wg show wg0 dump"])
+    rc, out, err = docker_exec(AWG_CONTAINER, ["wg", "show", "wg0", "dump"])
     if rc != 0:
-        log.warning({"event": "docker_exec_failed", "container": AWG_CONTAINER, "cmd": ["wg", "show", "wg0", "dump"], "rc": rc, "err": err})
+        log.warning({
+            "event": "docker_exec_failed",
+            "container": AWG_CONTAINER,
+            "cmd": ["wg", "show", "wg0", "dump"],
+            "rc": rc,
+            "err": err,
+        })
         return []
     return out.strip().splitlines()
 
@@ -119,11 +124,12 @@ def _build_conf_from_clients(
         if not ip:
             # пропускаем битые записи
             continue
+        ip_cidr = ip if "/" in ip else f"{ip}/32"
         lines.append("\n[Peer]\n")
         lines.append(f"PublicKey = {pubkey}\n")
         if psk:
             lines.append(f"PresharedKey = {psk}\n")
-        lines.append(f"AllowedIPs = {ip}/32\n")
+        lines.append(f"AllowedIPs = {ip_cidr}\n")
         lines.append("PersistentKeepalive = 25\n")
 
     return "".join(lines)
@@ -148,14 +154,20 @@ def _ensure_clients_table_dict() -> Dict[str, Any]:
     return {}
 
 
-def _gen_wg_keypair() -> (str, str):
-    # Run via shell to have proper PATH in BusyBox-based image
-    rc, priv, err = docker_exec(AWG_CONTAINER, ["sh", "-lc", "wg genkey"])
+def _gen_wg_keypair() -> Tuple[str, str]:
+    rc, priv, err = docker_exec(AWG_CONTAINER, ["wg", "genkey"])
     if rc != 0:
-        log.error({"event": "docker_exec_failed", "container": AWG_CONTAINER, "cmd": ["wg", "genkey"], "rc": rc, "err": err})
+        log.error({
+            "event": "docker_exec_failed",
+            "container": AWG_CONTAINER,
+            "cmd": ["wg", "genkey"],
+            "rc": rc,
+            "err": err,
+        })
         raise RuntimeError(f"wg genkey failed: {err}")
     rc, pub, err = docker_exec(
-        AWG_CONTAINER, ["sh", "-lc", "printf %s " + shq(priv.strip()) + " | wg pubkey"]
+        AWG_CONTAINER,
+        f"printf %s {shq(priv.strip())} | wg pubkey",
     )
     if rc != 0:
         raise RuntimeError(f"wg pubkey failed: {err}")
@@ -211,7 +223,7 @@ def _first_free_ip(subnet: str, used: set) -> str:
 def _sync_runtime(conf_path: str = WG_CONF) -> None:
     # wg-quick strip + wg syncconf
     cmd = f"wg-quick strip {shq(conf_path)} > /tmp/wg0.stripped && test -s /tmp/wg0.stripped && wg syncconf wg0 /tmp/wg0.stripped"
-    rc, out, err = docker_exec(AWG_CONTAINER, ["sh", "-lc", cmd])
+    rc, out, err = docker_exec(AWG_CONTAINER, cmd)
     if rc != 0:
         raise RuntimeError(f"syncconf failed: {err or out}")
 

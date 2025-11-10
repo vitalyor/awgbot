@@ -27,13 +27,28 @@ def _now_iso() -> str:
 
 
 def _read_json_from_container(path: str) -> Optional[Any]:
-    txt = docker_read_file(XRAY_CONTAINER, path)
-    if txt is None or txt.strip() == "":
+    """Прочитать JSON из контейнера, не падать, если файла нет/пустой/битый."""
+    try:
+        txt = docker_read_file(XRAY_CONTAINER, path)
+    except Exception as e:
+        log.warning({
+            "event": "xray_json_read_fail",
+            "path": path,
+            "err": str(e),
+        })
         return None
+
+    if not txt or txt.strip() == "":
+        return None
+
     try:
         return json.loads(txt)
     except json.JSONDecodeError as e:
-        log.warning({"event": "xray_json_decode_fail", "path": path, "err": str(e)})
+        log.warning({
+            "event": "xray_json_decode_fail",
+            "path": path,
+            "err": str(e),
+        })
         return None
 
 
