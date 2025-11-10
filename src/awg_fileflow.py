@@ -25,9 +25,32 @@ except Exception:
 # Paths & constants (compatible with your stack)
 # ─────────────────────────────────────────────────────────────────────────────
 AWG_CONTAINER = os.getenv("AWG_CONTAINER", "amnezia-awg")
-WG_IFACE = os.getenv("AWG_IFACE", "wg0")
-CONF_DIR = "/opt/amnezia/awg"
-CONF_PATH = f"{CONF_DIR}/{WG_IFACE}.conf"
+
+# Prefer explicit config path from env, otherwise fall back to default layout
+CONF_PATH_ENV = os.getenv("AWG_CONFIG_PATH")
+DEFAULT_IFACE = "wg0"
+
+# Determine interface name
+_env_iface = (os.getenv("AWG_IFACE", "").strip() or None)
+if _env_iface and _env_iface.lower() != "none":
+    _iface_detected = _env_iface
+else:
+    # If config path is given, derive iface from its basename (e.g., wg0.conf → wg0)
+    if CONF_PATH_ENV:
+        _base = os.path.basename(CONF_PATH_ENV)
+        _iface_detected = _base.split(".")[0] if _base else DEFAULT_IFACE
+    else:
+        _iface_detected = DEFAULT_IFACE
+
+WG_IFACE = _iface_detected
+
+if CONF_PATH_ENV:
+    CONF_PATH = CONF_PATH_ENV
+    CONF_DIR = os.path.dirname(CONF_PATH) or "/opt/amnezia/awg"
+else:
+    CONF_DIR = "/opt/amnezia/awg"
+    CONF_PATH = f"{CONF_DIR}/{WG_IFACE}.conf"
+
 PSK_PATH = f"{CONF_DIR}/wireguard_psk.key"
 SERVER_PUB = f"{CONF_DIR}/wireguard_server_public_key.key"
 LOCK_PATH = f"{CONF_DIR}/.conf.lock"
@@ -202,6 +225,18 @@ def server_public_key() -> str:
 
 def shared_psk() -> str:
     return _require_ok(f"cat {PSK_PATH}").strip()
+
+
+def get_dns_ip() -> str:
+    """Return amnezia-dns IP if available (inside AWG container), otherwise 1.1.1.1."""
+    try:
+        rc, out, _ = _sh("getent hosts amnezia-dns 2>/dev/null | awk '{print $1}' | head -n1", timeout=5)
+        ip = (out or "").strip()
+        if ip and ip.count(".") == 3:
+            return ip
+    except Exception:
+        pass
+    return "1.1.1.1"
 
 
 def _detect_external_host_fallback() -> str:
