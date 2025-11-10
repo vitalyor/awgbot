@@ -331,10 +331,15 @@ def _write_conf_text_atomic(conf_text: str) -> None:
 
     tmp_new = f"{CONF_DIR}/{WG_IFACE}.conf.new"
 
-    # 1) Пишем .new через here-doc, без base64
-    # важно: делаем '<<'EOF'' (single-quoted), чтобы без подстановок
+    # Подготовим строку для printf '%b': заменим backslash и одинарные кавычки.
+    # Внутри одинарных кавычек POSIX-способ экранирования: '\'' = ' + " ' " + '
+    escaped = (
+        conf_text.replace("\\", "\\\\").replace("'", "'\"'\"'").replace("\n", r"\n")
+    )
+
+    # 1) Пишем .new через printf '%b' — \n превратятся в реальные переводы строк
     _require_ok(
-        "set -e; umask 077; " f"cat > {tmp_new} <<'EOF'\n{conf_text}EOF\n",
+        "set -e; umask 077; " f"printf %b '{escaped}' > {tmp_new}",
         timeout=30,
     )
     _secure_conf_perms()
@@ -345,8 +350,7 @@ def _write_conf_text_atomic(conf_text: str) -> None:
         sha = _require_ok(f"sha256sum {tmp_new} | awk '{{print $1}}'", timeout=10)
         raise RuntimeError(f"tmp_new looks empty: size={sz}, sha256={sha}")
 
-    # 3) Подменяем и применяем конфиг.
-    # Используем flock, если он есть; иначе — best effort без него.
+    # 3) Подменяем и применяем конфиг под flock, если он есть
     cmd = f"""
 set -e
 if command -v flock >/dev/null 2>&1; then
@@ -689,11 +693,9 @@ def make_client_conf_text(cli_priv: str, assigned_ip: str) -> str:
     port = listen_port_from_dump(wg_dump()) or 0
     dns_ip = get_dns_ip()
     params = read_interface_obf_params()
-    endpoint_host = AWG_CONNECT_HOST or _detect_external_host_fallback()
+    endpoint_host = _detect_external_host_fallback() or AWG_CONNECT_HOST
     if not endpoint_host:
-        raise RuntimeError(
-            "Cannot determine endpoint host: set AWG_CONNECT_HOST or ensure network fallback works"
-        )
+        raise RuntimeError("Cannot determine endpoint host (runtime detect failed and AWG_CONNECT_HOST is empty)")
     endpoint = f"{endpoint_host}:{port}"
 
     lines = [
@@ -732,8 +734,10 @@ def create_peer_with_generated_keys(ip_cidr: str) -> Dict[str, Any]:
 
     rows = wg_dump()
     port = listen_port_from_dump(rows) or 0
-    endpoint_host = AWG_CONNECT_HOST or _detect_external_host_fallback()
-    endpoint = f"{endpoint_host}:{port}" if endpoint_host else f":{port}"
+    endpoint_host = _detect_external_host_fallback() or AWG_CONNECT_HOST
+    if not endpoint_host:
+        raise RuntimeError("Cannot determine endpoint host (runtime detect failed and AWG_CONNECT_HOST is empty)")
+    endpoint = f"{endpoint_host}:{port}"
 
     return {
         "client_private": cli_priv,
