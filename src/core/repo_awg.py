@@ -10,6 +10,7 @@ import uuid as uuidlib
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 import shlex
+import time
 
 from services.logger_setup import get_logger
 from services.util import (
@@ -136,12 +137,19 @@ def list_profiles() -> List[dict]:
         cid = c.get("clientId", "")
         ud = c.get("userData", {}) or {}
         ai = c.get("addInfo", {}) or {}
+
+        # Фолбэк: если рантайм ещё не подхватил пира, подставляем ip/32 из userData
+        allowed = allowed_map.get(cid)
+        if not allowed:
+            ip = ud.get("ip")
+            allowed = f"{ip}/32" if ip else "(none)"
+
         profiles.append(
             {
                 "uuid": ai.get("uuid") or cid,
                 "clientId": cid,
                 "name": ud.get("clientName"),
-                "allowed_ips": allowed_map.get(cid, "(none)"),
+                "allowed_ips": allowed,
                 "deleted": bool(ai.get("deleted")),
                 "owner_tid": ai.get("owner_tid"),
                 "userData": ud,
@@ -157,7 +165,7 @@ def _gen_wg_keypair() -> tuple[str, str]:
     для публичного ключа используем пайп через `printf`.
     """
     # приватный ключ
-    rc, priv, err = docker_exec(AWG_CONTAINER, ["sh", "-lc", "wg genkey"]) 
+    rc, priv, err = docker_exec(AWG_CONTAINER, ["sh", "-lc", "wg genkey"])
     if rc != 0 or not (priv or "").strip():
         raise RuntimeError(f"wg genkey failed: {err}")
     priv = priv.strip()
@@ -233,18 +241,40 @@ def _apply_runtime_sync() -> None:
     cmd = (
         "set -e; "
         "TMP=$(mktemp /tmp/wg0.stripped.XXXXXX); "
-        f"wg-quick strip \"{AWG_CONFIG_PATH}\" > \"$TMP\"; "
-        "test -s \"$TMP\"; "
-        "wg syncconf wg0 \"$TMP\"; "
-        "rm -f \"$TMP\""
+        f'wg-quick strip "{AWG_CONFIG_PATH}" > "$TMP"; '
+        'test -s "$TMP"; '
+        'wg syncconf wg0 "$TMP"; '
+        'rm -f "$TMP"'
     )
     rc, out, err = docker_exec(AWG_CONTAINER, ["sh", "-lc", cmd])
     if rc != 0:
-        log.warning({
-            "event": "awg_syncconf_failed",
-            "code": rc,
-            "err": err.strip(),
-        })
+        log.warning(
+            {
+                "event": "awg_syncconf_failed",
+                "code": rc,
+                "err": err.strip(),
+            }
+        )
+
+
+def _wg_dump_has_pub(pubkey: str) -> bool:
+    rc, out, _ = docker_exec(
+        AWG_CONTAINER, ["sh", "-lc", "wg show wg0 dump 2>/dev/null || true"]
+    )
+    if rc != 0 or not out:
+        return False
+    for line in out.splitlines()[1:]:
+        if line.startswith(pubkey + "\t"):
+            return True
+    return False
+
+
+def _wait_peer_in_dump(pubkey: str, attempts: int = 10, sleep_s: float = 0.2) -> None:
+    """Коротко ждём, пока peer появится в wg dump (сгладить гонку после syncconf)."""
+    for _ in range(attempts):
+        if _wg_dump_has_pub(pubkey):
+            return
+        time.sleep(sleep_s)
 
 
 def _sync_wg_conf_from_table() -> None:
@@ -326,6 +356,8 @@ def create_profile(profile_data: dict) -> str:
     clients.append(record)
     _write_clients_table(clients)
     _sync_wg_conf_from_table()
+    # коротко дождёмся появления пира в рантайме (сглаживает гонку)
+    _wait_peer_in_dump(pub)
     return client_uuid
 
 
