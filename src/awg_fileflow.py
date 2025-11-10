@@ -318,60 +318,47 @@ def _read_conf() -> str:
 
 
 def _write_conf_text_atomic(conf_text: str) -> None:
-    # 1) Basic sanity on the text we intend to write
+    # sanity
     if "[Interface]" not in conf_text:
         raise RuntimeError("Refusing to write conf_text without [Interface]")
     conf_text = conf_text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # ensure trailing newline to avoid partial last line truncation issues
     if not conf_text.endswith("\n"):
-        conf_text = conf_text + "\n"
+        conf_text += "\n"
 
-    # write flow: /tmp/<iface>.conf.b64 -> /tmp/<iface>.conf.tmp -> CONF_PATH
     encoded = base64.b64encode(conf_text.encode("utf-8")).decode("ascii")
-    tmp_b64 = f"/tmp/{WG_IFACE}.conf.b64"
-    tmp_plain = f"/tmp/{WG_IFACE}.conf.tmp"
+    tmp_new = f"{CONF_DIR}/{WG_IFACE}.conf.new"
+    tmp_stripped = f"/tmp/{WG_IFACE}.stripped"
 
-    # create temp payload and decode to a plain file
-    _require_ok(f"set -e; umask 077; cat > {tmp_b64} <<'B64'\n{encoded}\nB64")
-    _require_ok(f"set -e; umask 077; base64 -d {tmp_b64} > {tmp_plain}")
+    # 1) Сразу декодируем В .new одной командой (меньше шансов на нули)
+    _require_ok("set -e; umask 077; " f"base64 -d > {tmp_new} <<'B64'\n{encoded}\nB64")
+    _secure_conf_perms()
 
-    # 2) Move atomically under a file lock if flock exists
+    # 2) Мини-диагностика: убедимся, что .new не пуст
+    sz = int(_require_ok(f"stat -c %s {tmp_new}"))
+    if sz < 40:
+        sha = _require_ok(f"sha256sum {tmp_new} | awk '{{print $1}}'")
+        raise RuntimeError(f"tmp_new looks empty: size={sz}, sha256={sha}")
+
+    # 3) Валидируем: strip+syncconf (как делает приложение)
+    _require_ok(f'wg-quick strip "{tmp_new}" > {tmp_stripped}')
+    _require_ok(f"wg syncconf {WG_IFACE} {tmp_stripped}")
+
+    # 4) Атомарная подмена основного файла под flock
     rc, _, _ = _sh("command -v flock >/dev/null 2>&1")
     if rc == 0:
-        _require_ok(
-            f"flock -x {LOCK_PATH} -c 'mv -f {tmp_plain} {CONF_PATH}; rm -f {tmp_b64}'"
-        )
+        _require_ok(f"flock -x {LOCK_PATH} -c 'mv -f {tmp_new} {CONF_PATH}'")
     else:
-        _require_ok(f"mv -f {tmp_plain} {CONF_PATH}; rm -f {tmp_b64}")
-
-    # 3) permissions and sync to be extra safe
+        _require_ok(f"mv -f {tmp_new} {CONF_PATH}")
     _secure_conf_perms()
-    _sh("sync >/dev/null 2>&1 || true")
-    _sh("sleep 0.1 || true")
 
-    # 4) Re-validate by readback with diagnostics
-    rc, written, err = _sh(f"cat {CONF_PATH} 2>/dev/null || true")
-    if rc != 0 or not written:
-        # print some diag to help debugging
-        sz = _require_ok(f"stat -c %s {CONF_PATH} 2>/dev/null || echo 0").strip()
-        sha = _require_ok(
-            f"sha256sum {CONF_PATH} 2>/dev/null | awk '{{print $1}}' || echo 0"
-        ).strip()
+    # 5) Контрольное чтение
+    rsz = int(_require_ok(f"stat -c %s {CONF_PATH}"))
+    if rsz < 40:
+        sha = _require_ok(f"sha256sum {CONF_PATH} | awk '{{print $1}}'")
+        head = _require_ok(f"head -n 20 {CONF_PATH} || true")
         raise RuntimeError(
-            f"Refusing to write suspicious conf_text (readback fail): rc={rc}, size={sz}, sha256={sha}, err={err}"
+            f"Refusing to write suspicious conf_text (post-write): size={rsz} sha256={sha}\nHEAD:\n{head}"
         )
-
-    # normalize and validate content
-    w = written.strip()
-    if "[Interface]" not in w or len(w) < 40:
-        # include a short head for debugging
-        head = "\n".join(w.splitlines()[:20])
-        raise RuntimeError(
-            f"Refusing to write suspicious conf_text (post-write): HEAD:\n{head}"
-        )
-
-    # success
 
 
 def _append_peer_block_in_text(
@@ -448,7 +435,6 @@ def _has_peer_in_text(conf_text: str, pubkey: str) -> bool:
     return False
 
 
-
 def _ensure_slash32(ip_or_cidr: str) -> str:
     ip_or_cidr = ip_or_cidr.strip()
     if "/" not in ip_or_cidr:
@@ -456,9 +442,11 @@ def _ensure_slash32(ip_or_cidr: str) -> str:
     _ = ipaddress.ip_interface(ip_or_cidr)  # validate
     return ip_or_cidr
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper: synthesize [Interface] from runtime
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _synthesize_interface_from_runtime() -> str:
     """
