@@ -1084,17 +1084,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await edit_or_send(update, context, text, kb, parse_mode="HTML")
             return
         elif ptype in ("amneziawg", "awg"):
-            info = AWG.find_user(u.id, pname)
-            if not info:
-                await edit_or_send(
-                    update,
-                    context,
-                    "Конфигурация AmneziaWG не найдена в конфиге сервера.",
-                    InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]
-                    ),
-                )
-                return
+            # Показываем карточку AWG без обращения к устаревшим find_user
+            try:
+                fac = AWG.facts()
+                listen_port = fac.get("listen_port")
+            except Exception:
+                listen_port = None
+            ep = f"{AWG_CONNECT_HOST}:{listen_port}" if listen_port else ""
             kb = InlineKeyboardMarkup(
                 [
                     [
@@ -1113,10 +1109,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             text = (
                 f"<b>{pname}</b> · AmneziaWG\n"
-                f"• Endpoint: <code>{info['endpoint']}</code>\n"
-                f"• Port: <code>{info['port']}</code>\n"
+                + (f"• Endpoint: <code>{ep}</code>\n" if ep else "")
+                + (f"• Port: <code>{listen_port}</code>\n" if listen_port else "")
             )
-            await edit_or_send(update, context, text, kb, parse_mode="HTML")
+            await edit_or_send(update, context, text or "AmneziaWG", kb, parse_mode="HTML")
             return
 
     if data.startswith("prof_get_vpn:"):
@@ -1176,22 +1172,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML",
                 )
                 return
-            info_wg = AWG.find_user(u.id, pname)
-            if info_wg:
-                await edit_or_send(
-                    update,
-                    context,
-                    "Конфигурация AmneziaWG была создана старой версией бота без сохранения vpn://. "
-                    "Пересоздайте конфигурацию, чтобы получить импорт одной строкой.",
-                    InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]
-                    ),
-                )
-                return
+            # Старые записи могли не сохранять vpn_url — надёжнее пересоздать
             await edit_or_send(
                 update,
                 context,
-                "Конфигурация AmneziaWG не найдена.",
+                "Конфигурация AmneziaWG создана старой версией бота без сохранения ключа импорта.\nПересоздайте конфигурацию для получения строки импорта.",
                 InlineKeyboardMarkup(
                     [[InlineKeyboardButton("⬅️ Назад", callback_data="my_profiles")]]
                 ),
@@ -1265,7 +1250,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ptype == "xray":
                 ok = XR.remove_user_by_name(u.id, pname)
             elif ptype in ("amneziawg", "awg"):
-                ok = AWG.remove_user_by_name(u.id, pname)
+                # Удаляем peer по IP из state
+                ip_cidr = None
+                for p in user.get("profiles", []):
+                    if p.get("name") == pname and p.get("type") in ("amneziawg", "awg") and not p.get("deleted"):
+                        ip_cidr = p.get("assigned_ip") or ""
+                        break
+                if ip_cidr:
+                    try:
+                        res = AWG.remove_peer_by_ip(ip_cidr)
+                        ok = res.get("removed_count", 0) > 0
+                    except Exception:
+                        ok = False
+                else:
+                    ok = False
         except Exception:
             ok = False
         st = load_state()
@@ -1765,7 +1763,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ptype == "xray":
                 XR.remove_user_by_name(int(tid), pname)
             elif ptype in ("amneziawg", "awg"):
-                AWG.remove_user_by_name(int(tid), pname)
+                # Удаляем AWG-профиль по IP из записи пользователя
+                ip_cidr = None
+                st = load_state()
+                urec = st["users"].get(tid, {})
+                for p in urec.get("profiles", []):
+                    if p.get("name") == pname and p.get("type") in ("amneziawg", "awg") and not p.get("deleted"):
+                        ip_cidr = p.get("assigned_ip") or ""
+                        break
+                if ip_cidr:
+                    try:
+                        AWG.remove_peer_by_ip(ip_cidr)
+                    except Exception:
+                        pass
         except Exception:
             pass
         st = load_state()
@@ -2174,7 +2184,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_app_picker(update, context, name, for_edit=True)
 
             elif typ in ("amneziawg", "awg"):
-                created = AWG.add_user(u.id, name)
+                # Создаём peer с авто-IP через awg.py (куда ты перенёс awg_fileflow)
+                res = AWG.create_peer_with_generated_keys_auto()
+                created = {
+                    "email": f"{u.id}.{name}@bot",
+                    "vpn_url": res.get("client_conf", ""),   # это текст .conf для импорта в Amnezia
+                    "endpoint": res.get("endpoint", ""),
+                    "assigned_ip": res.get("assigned_ip", ""),
+                    "pubkey": res.get("client_public", ""),
+                }
                 user["profiles"].append(
                     {
                         "name": name,
@@ -2182,13 +2200,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "email": created["email"],
                         "vpn_url": created.get("vpn_url", ""),
                         "endpoint": created.get("endpoint", ""),
+                        "assigned_ip": created.get("assigned_ip", ""),
                         "created_at": now_iso(),
                     }
                 )
                 save_state(st)
-                kb = InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅️ В меню", callback_data="menu")]]
-                )
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="menu")]])
                 try:
                     await update.message.delete()
                 except Exception:
