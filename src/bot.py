@@ -49,7 +49,7 @@ load_env_kv_file(SECRETS_FILE, overwrite=True)
 
 ERROR_NOTIFY_COOLDOWN_SEC = int(os.getenv("ERROR_NOTIFY_COOLDOWN_SEC", "600"))
 
-from logger_setup import get_logger
+from services.logger_setup import get_logger
 
 logger = get_logger()
 
