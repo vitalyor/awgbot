@@ -1,6 +1,6 @@
 import os, subprocess, uuid, time, re, logging
 from datetime import datetime, UTC
-from typing import Optional
+from typing import Optional, Union, List
 
 logger = logging.getLogger("awgbot")
 
@@ -65,31 +65,61 @@ def _should_retry(errmsg: str) -> bool:
 
 def docker_exec(
     container: str,
-    *args: str,
+    cmd: Union[str, List[str]],
+    *,
     timeout: int = DOCKER_EXEC_TIMEOUT,
     retries: int = DOCKER_EXEC_RETRIES,
     retry_delay: float = DOCKER_EXEC_RETRY_SECS,
-) -> str:
+) -> tuple[int, str, str]:
+    """
+    Запускает команду внутри контейнера и возвращает (rc, stdout, stderr).
+    - cmd: list → исполняется как argv без шелла: docker exec -i <ctr> <argv...>
+    - cmd: str  → исполняется через оболочку контейнера: sh -lc "<cmd>"
+    Не выбрасывает исключение при rc!=0; повторяет попытку на ретраибл-ошибках.
+    """
     last_err = ""
     for attempt in range(retries + 1):
-        try:
-            if attempt:
-                logger.info({"event": "docker_exec_retry", "try": attempt, "container": container, "cmd": args})
-            else:
-                logger.debug({"event": "docker_exec", "container": container, "cmd": args})
-            return run(["docker", "exec", "-i", container] + list(args), timeout=timeout)
-        except Exception as e:
-            last_err = str(e)
-            if attempt < retries and _should_retry(last_err):
-                logger.warning({"event": "docker_exec_retry_wait", "container": container, "msg": last_err})
-                time.sleep(retry_delay)
-                continue
-            break
-    logger.error({"event": "docker_exec_failed", "container": container, "err": last_err})
-    raise RuntimeError(f"docker_exec failed ({container}): {last_err}")
+        if isinstance(cmd, list):
+            argv = ["docker", "exec", "-i", container, *cmd]
+            cmd_repr = cmd
+        elif isinstance(cmd, str):
+            argv = ["docker", "exec", "-i", container, "sh", "-lc", cmd]
+            cmd_repr = cmd
+        else:
+            raise TypeError("cmd must be str or list[str]")
+
+        t0 = time.monotonic()
+        p = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+        rc = p.returncode
+        out = (p.stdout or "").strip()
+        err = (p.stderr or "").strip()
+        dt = round(time.monotonic() - t0, 2)
+
+        if rc == 0:
+            logger.debug({"event": "docker_exec_ok", "container": container, "cmd": cmd_repr, "t": dt})
+            return rc, out, err
+
+        # Ошибка — решить, повторять ли
+        last_err = err or f"command failed ({' '.join(argv)})"
+        if attempt < retries and _should_retry(last_err):
+            logger.warning({"event": "docker_exec_retry", "try": attempt + 1, "container": container, "cmd": cmd_repr, "err": last_err})
+            time.sleep(retry_delay)
+            continue
+
+        logger.warning({"event": "docker_exec_failed", "container": container, "cmd": cmd_repr, "rc": rc, "err": last_err, "t": dt})
+        return rc, out, err
 
 def docker_read_file(container: str, path: str, timeout: int = DOCKER_EXEC_TIMEOUT) -> str:
-    return docker_exec(container, "sh", "-lc", f"cat {shq(path)}", timeout=timeout)
+    rc, out, err = docker_exec(container, ["sh", "-lc", f"cat {shq(path)}"], timeout=timeout)
+    if rc != 0:
+        raise RuntimeError(err or f"failed to read {path}")
+    return out
 
 def docker_write_file_atomic(container: str, path: str, content: str, timeout: int = 15):
     """
@@ -102,12 +132,13 @@ def docker_write_file_atomic(container: str, path: str, content: str, timeout: i
         f.write(content)
     try:
         run(["docker", "cp", host_tmp, f"{container}:{path}.tmp"], timeout=timeout)
-        docker_exec(
+        rc, _, err = docker_exec(
             container,
-            "sh", "-lc",
-            f"mkdir -p $(dirname {shq(path)}) && mv {shq(path)}.tmp {shq(path)}",
-            timeout=timeout
+            ["sh", "-lc", f"mkdir -p $(dirname {shq(path)}) && mv {shq(path)}.tmp {shq(path)}"],
+            timeout=timeout,
         )
+        if rc != 0:
+            raise RuntimeError(err or "docker mv failed")
         logger.info({"event": "docker_write_atomic", "container": container, "path": path})
     finally:
         try:
@@ -123,11 +154,10 @@ def now_iso() -> str:
 
 def get_awg_bin() -> str:
     try:
-        out = docker_exec(
-            AWG_CONTAINER, "sh", "-lc",
-            f"command -v {shq(AWG_BIN)} >/dev/null && echo OK || echo NO"
+        rc, out, _ = docker_exec(
+            AWG_CONTAINER, ["sh", "-lc", f"command -v {shq(AWG_BIN)} >/dev/null && echo OK || echo NO"],
         )
-        if out.strip() == "OK":
+        if rc == 0 and out.strip() == "OK":
             return AWG_BIN
     except Exception:
         pass
