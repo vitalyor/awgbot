@@ -9,6 +9,7 @@ import ipaddress
 import uuid as uuidlib
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
+import shlex
 
 from services.logger_setup import get_logger
 from services.util import (
@@ -151,18 +152,21 @@ def list_profiles() -> List[dict]:
 
 
 def _gen_wg_keypair() -> tuple[str, str]:
-    """Генерирует пару приватный/публичный ключ внутри контейнера."""
-    rc, priv, err = docker_exec(AWG_CONTAINER, ["sh", "-lc", "wg genkey"])
-    if rc != 0 or not priv.strip():
+    """Генерирует пару приватный/публичный ключ внутри контейнера.
+    Избегаем передачи stdin через docker_exec (input_bytes не поддерживается):
+    для публичного ключа используем пайп через `printf`.
+    """
+    # приватный ключ
+    rc, priv, err = docker_exec(AWG_CONTAINER, ["sh", "-lc", "wg genkey"]) 
+    if rc != 0 or not (priv or "").strip():
         raise RuntimeError(f"wg genkey failed: {err}")
     priv = priv.strip()
 
-    rc, pub, err = docker_exec(
-        AWG_CONTAINER,
-        ["sh", "-lc", "wg pubkey"],
-        input_bytes=(priv + "\n").encode("utf-8"),
-    )
-    if rc != 0 or not pub.strip():
+    # публичный ключ: безопасно экранируем приватный ключ и прокидываем через printf | wg pubkey
+    quoted_priv = shlex.quote(priv)
+    cmd = f"sh -lc 'printf %s {quoted_priv} | wg pubkey'"
+    rc, pub, err = docker_exec(AWG_CONTAINER, cmd)
+    if rc != 0 or not (pub or "").strip():
         raise RuntimeError(f"wg pubkey failed: {err}")
     pub = pub.strip()
     return priv, pub
