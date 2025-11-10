@@ -877,14 +877,44 @@ def remove_peer_by_ip(ip_or_cidr: str) -> Dict[str, Any]:
     return {"removed_count": len(removed_pub), "removed_pubkeys": removed_pub, "ip": target}
 
 
-def clean_all_peers() -> None:
+
+def clean_all_peers(strict_verify: bool = True) -> Dict[str, Any]:
     """
-    Keep only [Interface] in the file, preserving/adding obfuscation, then apply.
+    Remove all [Peer] sections and keep only a valid [Interface] built from runtime.
+    This mirrors the app behavior more safely than editing the file in-place.
+
+    Steps:
+      1) Count current peers from runtime (wg dump).
+      2) Synthesize a clean [Interface] from runtime (private key, port, subnet, obf params).
+      3) Write + apply atomically (wg-quick strip → wg syncconf).
+      4) Verify that no peers remain (optional strict check).
+
+    Returns a summary with removed_count and current facts.
     """
-    conf = _read_conf()
-    conf2 = _strip_to_interface_only(conf)
-    conf2 = _ensure_interface_has_obf(conf2)
-    _write_conf_text_atomic(conf2)
+    # 1) Count peers before
+    before = list_peers()
+    removed_count = len([p for p in before if p.get("allowed_ips")])
+
+    # 2) Build interface from runtime (always) to avoid stale/invalid file contents
+    iface_conf = _synthesize_interface_from_runtime()
+    iface_conf = _ensure_interface_has_obf(iface_conf)
+
+    # 3) Apply
+    _write_conf_text_atomic(iface_conf)
+
+    # 4) Verify
+    rows = wg_dump()
+    peers_left = [r for r in rows[1:] if len(r) >= 4 and r[3].strip()]
+    if strict_verify and peers_left:
+        # Defensive: include a short dump excerpt for diagnostics
+        dump_head = "\n".join("\t".join(r[:5]) for r in rows[:5])
+        raise RuntimeError(f"Expected zero peers after clean, found {len(peers_left)} left. Dump:\n{dump_head}")
+
+    return {
+        "removed_count": removed_count,
+        "listen_port": listen_port_from_dump(rows),
+        "obf": read_interface_obf_params(),
+    }
 
 
 def make_client_conf_text(cli_priv: str, assigned_ip: str) -> str:
