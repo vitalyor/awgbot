@@ -1,10 +1,14 @@
-# xray.py
-import json, re, uuid, urllib.parse
+import json, re, uuid, urllib.parse, time
+import os
 from typing import Dict, Any, Optional
 from util import (
     docker_read_file, docker_write_file_atomic, docker_exec, docker_restart, shq,
     XRAY_CONTAINER, XRAY_CONFIG_PATH, XRAY_INBOUND_INDEX, XRAY_CONNECT_HOST
 )
+
+# === Stage 0 backup/rotation policy ===
+XRAY_BACKUP_KEEP = int(os.environ.get("XRAY_BACKUP_KEEP", "10"))
+XRAY_DATEFMT = "%Y%m%d-%H%M%S"
 
 # ========================= helpers to read/write config =========================
 
@@ -13,14 +17,24 @@ def _load_cfg() -> Dict[str, Any]:
     return json.loads(raw)
 
 def _save_cfg(cfg: Dict[str, Any]):
-    # (опциональный) бэкап перед записью — не упадём, если не получилось
+    """Atomically write server.json with timestamped backup and rotation (Stage 0)."""
+    # 1) make timestamped backup (best-effort)
     try:
         docker_exec(
             XRAY_CONTAINER, "sh", "-lc",
-            f"cp -f {shq(XRAY_CONFIG_PATH)} {shq(XRAY_CONFIG_PATH)}.bak-$(date +%Y%m%d-%H%M%S) || true"
+            f"set -e; if [ -f {shq(XRAY_CONFIG_PATH)} ]; then cp -f {shq(XRAY_CONFIG_PATH)} {shq(XRAY_CONFIG_PATH)}.bak-$(date +%Y%m%d-%H%M%S); fi; true"
         )
     except Exception:
         pass
+    # 2) rotate old backups (keep only XRAY_BACKUP_KEEP most recent)
+    try:
+        docker_exec(
+            XRAY_CONTAINER, "sh", "-lc",
+            f"ls -1 {shq(XRAY_CONFIG_PATH)}.bak-* 2>/dev/null | sort -r | awk 'NR>{XRAY_BACKUP_KEEP}{{print $0}}' | xargs -r rm -f 2>/dev/null || true"
+        )
+    except Exception:
+        pass
+    # 3) atomic write
     docker_write_file_atomic(
         XRAY_CONTAINER, XRAY_CONFIG_PATH, json.dumps(cfg, ensure_ascii=False, indent=2)
     )

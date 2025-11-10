@@ -9,6 +9,7 @@ import base64
 import re
 import json
 from datetime import datetime, timezone
+import time
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Imports that work both when this file is imported as a top-level module
@@ -92,6 +93,9 @@ PSK_PATH = f"{CONF_DIR}/wireguard_psk.key"
 SERVER_PUB = f"{CONF_DIR}/wireguard_server_public_key.key"
 LOCK_PATH = f"{CONF_DIR}/.conf.lock"
 CLIENTS_TABLE = f"{CONF_DIR}/clientsTable"
+CLIENTS_LOCK = f"{CONF_DIR}/.clients.lock"
+BACKUP_KEEP = int(os.getenv("AWG_BACKUP_KEEP", "10"))  # how many backups to keep
+DATEFMT = "%Y%m%d-%H%M%S"
 
 # Default (fallback) obfuscation values (used if not present in file).
 # If you want to force specific values, set these ENV vars in the AWG container.
@@ -160,13 +164,31 @@ def _docker_cp_local_to_container(local_path: str, container_dst: str) -> None:
         raise RuntimeError(f"docker cp failed: rc={rc}\n{err}")
 
 def _write_text_into_container(container_path: str, text: str) -> None:
-    """Write text content to a file inside the AWG container using docker cp."""
+    """Atomically replace a file inside the AWG container with backup & rotation."""
+    # 1) write local tmp
     tmp_dir = "/app/data/tmp"
     _ensure_dir(tmp_dir)
-    local_tmp = os.path.join(tmp_dir, os.path.basename(container_path) + ".new")
+    base = os.path.basename(container_path)
+    local_tmp = os.path.join(tmp_dir, base + ".new")
     with open(local_tmp, "w", encoding="utf-8") as f:
         f.write(text)
-    _docker_cp_local_to_container(local_tmp, container_path)
+
+    # 2) copy into container as <target>.new
+    container_tmp = container_path + ".new"
+    _docker_cp_local_to_container(local_tmp, container_tmp)
+
+    # 3) inside container: backup, rotate, mv (with flock if available)
+    cmd = (
+        "set -e; "
+        f"dst={container_path!s}; tmp={container_tmp!s}; "
+        "bak=\"${dst}.bak-$(date +%Y%m%d-%H%M%S)\"; "
+        "if [ -e \"$dst\" ]; then cp -f \"$dst\" \"$bak\" 2>/dev/null || true; fi; "
+        f"ls -1 \"$dst\".bak-* 2>/dev/null | sort -r | awk 'NR>{BACKUP_KEEP}{{print $0}}' | xargs -r rm -f 2>/dev/null || true; "
+        "if command -v flock >/dev/null 2>&1; then "
+        f"  flock -x {CLIENTS_LOCK} -c \"mv -f \\\"$tmp\\\" \\\"$dst\\\"\"; "
+        "else mv -f \"$tmp\" \"$dst\"; fi"
+    )
+    _require_ok(cmd, timeout=60)
 
 
 def _with_lock(cmd: str) -> str:
@@ -491,8 +513,11 @@ def _write_conf_text_atomic(conf_text: str) -> None:
     # 3) Apply inside container: mv -> strip -> syncconf (single call)
     # Keep it simple; no nested quotes or here-docs
     apply_cmd = (
-        f"set -e; "
-        f"mv -f {container_new} {CONF_PATH}; "
+        "set -e; "
+        f"mv -f {container_new} {CONF_PATH}.new; "
+        f"if [ -e {CONF_PATH} ]; then cp -f {CONF_PATH} {CONF_PATH}.bak-$(date +%Y%m%d-%H%M%S) 2>/dev/null || true; fi; "
+        f"ls -1 {CONF_PATH}.bak-* 2>/dev/null | sort -r | awk 'NR>{BACKUP_KEEP}{{print $0}}' | xargs -r rm -f 2>/dev/null || true; "
+        f"if command -v flock >/dev/null 2>&1; then flock -x {LOCK_PATH} -c \"mv -f {CONF_PATH}.new {CONF_PATH}\"; else mv -f {CONF_PATH}.new {CONF_PATH}; fi; "
         f"chown root:root {CONF_PATH} 2>/dev/null || true; "
         f"chmod 600 {CONF_PATH} 2>/dev/null || true; "
         f"chmod 700 {CONF_DIR} 2>/dev/null || true; "
