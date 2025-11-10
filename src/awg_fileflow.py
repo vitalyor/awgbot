@@ -65,6 +65,7 @@ def _require_ok(cmd: str, timeout: int = 15) -> str:
     return out
 
 
+
 def _secure_conf_perms() -> None:
     """Make sure config & keys have strict perms (mirrors app behavior)."""
     _require_ok(
@@ -72,6 +73,25 @@ def _secure_conf_perms() -> None:
     )
     _require_ok(f"chmod 600 {CONF_PATH} {PSK_PATH} {SERVER_PUB} 2>/dev/null || true")
     _require_ok(f"chmod 700 {CONF_DIR} 2>/dev/null || true")
+
+# Filesystem/transfer helpers
+
+def _ensure_dir(path: str) -> None:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _docker_cp_local_to_container(local_path: str, container_dst: str) -> None:
+    """Copy a local file into the AWG container using `docker cp`.
+    Avoids here-doc/base64 quirks and BusyBox limitations."""
+    # container_dst must be an absolute path inside the container
+    if not container_dst.startswith("/"):
+        raise ValueError("container_dst must be absolute path")
+    rc, out, err = run_cmd(f"docker cp {local_path} {AWG_CONTAINER}:{container_dst}", timeout=30)
+    if rc != 0:
+        raise RuntimeError(f"docker cp failed: rc={rc}\n{err}")
 
 
 def _with_lock(cmd: str) -> str:
@@ -329,59 +349,41 @@ def _write_conf_text_atomic(conf_text: str) -> None:
     if not conf_text.endswith("\n"):
         conf_text += "\n"
 
-    tmp_new = f"{CONF_DIR}/{WG_IFACE}.conf.new"
+    # 1) Write to a local temp file (inside the bot container)
+    tmp_dir = "/app/data/tmp"
+    _ensure_dir(tmp_dir)
+    local_tmp = os.path.join(tmp_dir, f"{WG_IFACE}.conf.new")
+    with open(local_tmp, "w", encoding="utf-8") as f:
+        f.write(conf_text)
 
-    # Подготовим строку для printf '%b': заменим backslash и одинарные кавычки.
-    # Внутри одинарных кавычек POSIX-способ экранирования: '\'' = ' + " ' " + '
-    escaped = (
-        conf_text.replace("\\", "\\\\").replace("'", "'\"'\"'").replace("\n", r"\n")
+    # quick sanity on local file
+    if os.path.getsize(local_tmp) < 40:
+        raise RuntimeError("Refusing to write suspiciously small config (local tmp)")
+
+    # 2) Copy into AWG container as .new (no shell quoting headaches)
+    container_new = f"{CONF_DIR}/{WG_IFACE}.conf.new"
+    _docker_cp_local_to_container(local_tmp, container_new)
+
+    # 3) Apply inside container: mv -> strip -> syncconf (single call)
+    # Keep it simple; no nested quotes or here-docs
+    apply_cmd = (
+        f"set -e; "
+        f"mv -f {container_new} {CONF_PATH}; "
+        f"chown root:root {CONF_PATH} 2>/dev/null || true; "
+        f"chmod 600 {CONF_PATH} 2>/dev/null || true; "
+        f"chmod 700 {CONF_DIR} 2>/dev/null || true; "
+        f"wg-quick strip {CONF_PATH} > /tmp/{WG_IFACE}.stripped; "
+        f"test -s /tmp/{WG_IFACE}.stripped; "
+        f"wg syncconf {WG_IFACE} /tmp/{WG_IFACE}.stripped"
     )
+    _require_ok(apply_cmd, timeout=60)
 
-    # 1) Пишем .new через printf '%b' — \n превратятся в реальные переводы строк
-    _require_ok(
-        "set -e; umask 077; " f"printf %b '{escaped}' > {tmp_new}",
-        timeout=30,
-    )
-    _secure_conf_perms()
-
-    # 2) sanity: .new не пуст
-    sz = int(_require_ok(f"stat -c %s {tmp_new}", timeout=10))
-    if sz < 40:
-        sha = _require_ok(f"sha256sum {tmp_new} | awk '{{print $1}}'", timeout=10)
-        raise RuntimeError(f"tmp_new looks empty: size={sz}, sha256={sha}")
-
-    # 3) Подменяем и применяем конфиг под flock, если он есть
-    cmd = f"""
-set -e
-if command -v flock >/dev/null 2>&1; then
-  flock -x {LOCK_PATH} -c '
-    mv -f {tmp_new} {CONF_PATH}
-    chown root:root {CONF_PATH} 2>/dev/null || true
-    chmod 600 {CONF_PATH} 2>/dev/null || true
-    chmod 700 {CONF_DIR} 2>/dev/null || true
-    wg-quick strip "{CONF_PATH}" > /tmp/{WG_IFACE}.stripped
-    test -s /tmp/{WG_IFACE}.stripped
-    wg syncconf {WG_IFACE} /tmp/{WG_IFACE}.stripped
-  '
-else
-  mv -f {tmp_new} {CONF_PATH}
-  chown root:root {CONF_PATH} 2>/dev/null || true
-  chmod 600 {CONF_PATH} 2>/dev/null || true
-  chmod 700 {CONF_DIR} 2>/dev/null || true
-  wg-quick strip "{CONF_PATH}" > /tmp/{WG_IFACE}.stripped
-  test -s /tmp/{WG_IFACE}.stripped
-  wg syncconf {WG_IFACE} /tmp/{WG_IFACE}.stripped
-fi
-"""
-    _require_ok(cmd, timeout=60)
-
-    # 4) post-check
+    # 4) post-check on container file
     rsz = int(_require_ok(f"stat -c %s {CONF_PATH}", timeout=10))
     if rsz < 40:
-        sha = _require_ok(f"sha256sum {CONF_PATH} | awk '{{print $1}}'", timeout=10)
         head = _require_ok(f"head -n 20 {CONF_PATH} || true", timeout=5)
         raise RuntimeError(
-            f"Refusing to write suspicious conf_text (post-write): size={rsz} sha256={sha}\nHEAD:\n{head}"
+            f"Refusing to write suspicious conf_text (post-write): size={rsz}\nHEAD:\n{head}"
         )
 
 
