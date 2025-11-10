@@ -226,6 +226,27 @@ def facts() -> dict:
     return {"port": port, "subnet": subnet, "dns": dns, "endpoint": endpoint}
 
 
+def _apply_runtime_sync() -> None:
+    """Применяет изменения wg0.conf к рантайму WireGuard внутри контейнера.
+    Используем wg-quick strip + wg syncconf.
+    """
+    cmd = (
+        "set -e; "
+        "TMP=$(mktemp /tmp/wg0.stripped.XXXXXX); "
+        f"wg-quick strip \"{AWG_CONFIG_PATH}\" > \"$TMP\"; "
+        "test -s \"$TMP\"; "
+        "wg syncconf wg0 \"$TMP\"; "
+        "rm -f \"$TMP\""
+    )
+    rc, out, err = docker_exec(AWG_CONTAINER, ["sh", "-lc", cmd])
+    if rc != 0:
+        log.warning({
+            "event": "awg_syncconf_failed",
+            "code": rc,
+            "err": err.strip(),
+        })
+
+
 def _sync_wg_conf_from_table() -> None:
     """Перестраивает wg0.conf на основе clientsTable."""
     clients = _read_clients_table()
@@ -260,6 +281,9 @@ def _sync_wg_conf_from_table() -> None:
     docker_write_file_atomic(
         AWG_CONTAINER, AWG_CONFIG_PATH, "\n".join(conf_lines) + "\n"
     )
+
+    # применяем конфиг в рантайме
+    _apply_runtime_sync()
 
 
 def create_profile(profile_data: dict) -> str:
