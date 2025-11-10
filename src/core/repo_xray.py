@@ -1,19 +1,19 @@
 # src/core/repo_xray.py
-# ЕДИНЫЙ слой предметной логики для XRAY.
-# Работает напрямую с файлами внутри контейнера amnezia-xray через services.util.
-
+# Предметная логика для XRay. Прямая работа с файлами в контейнере amnezia-xray.
 from __future__ import annotations
 
 import json
-from typing import Optional, Dict, Any, List
+import uuid as uuidlib
+from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 
 from services.logger_setup import get_logger
 from services.util import (
+    docker_exec,
     docker_read_file,
     docker_write_file_atomic,
     XRAY_CONTAINER,
-    XRAY_CONFIG_PATH,
+    XRAY_SERVER_JSON,
 )
 
 log = get_logger("core.repo_xray")
@@ -25,7 +25,6 @@ CLIENTS_TABLE = "/opt/amnezia/xray/clientsTable"
 
 
 def _now_iso() -> str:
-    """Возвращает ISO-8601 UTC без микросекунд, с суффиксом 'Z'."""
     return (
         datetime.now(timezone.utc)
         .replace(microsecond=0)
@@ -35,89 +34,101 @@ def _now_iso() -> str:
 
 
 def _ctime_like() -> str:
-    """Формат времени в стиле: Mon Nov 10 08:35:32 2025."""
     return datetime.now(timezone.utc).strftime("%a %b %d %H:%M:%S %Y")
 
 
-def _read_json_from_container(path: str) -> Optional[Any]:
-    """Прочитать JSON из контейнера, не падать, если файла нет/битый."""
+def _read_json(container: str, path: str, default):
     try:
-        txt = docker_read_file(XRAY_CONTAINER, path)
+        txt = docker_read_file(container, path)
+        return json.loads(txt) if txt.strip() else default
     except Exception as e:
-        log.warning({"event": "xray_json_read_fail", "path": path, "err": str(e)})
-        return None
-    if not txt or txt.strip() == "":
-        return None
-    try:
-        return json.loads(txt)
-    except json.JSONDecodeError as e:
-        log.warning({"event": "xray_json_decode_fail", "path": path, "err": str(e)})
-        return None
+        log.warning({"msg": f"Failed to read JSON {path}: {e}"})
+        return default
 
 
-def _write_json_list(path: str, items: List[Dict[str, Any]]) -> None:
-    """Пишем строго как массив объектов (совместимо со сторонним UI)."""
-    payload = json.dumps(items, ensure_ascii=False, indent=2)
-    docker_write_file_atomic(XRAY_CONTAINER, path, payload)
+def _write_json(container: str, path: str, obj) -> None:
+    docker_write_file_atomic(
+        container, path, json.dumps(obj, ensure_ascii=False, indent=2)
+    )
 
 
-def _normalize_to_list(raw: Any, kind: str = "xray") -> List[Dict[str, Any]]:
-    """
-    Приводим данные к массиву и гарантируем наличие обязательных полей.
-    Поддерживаем две формы исходника:
-      - dict { "<clientId>": { ... }, ... }
-      - list [ { "clientId": "...", ... }, ... ]
-    """
-    items: List[Dict[str, Any]] = []
-
+def _read_clients_table() -> List[Dict[str, Any]]:
+    raw = _read_json(XRAY_CONTAINER, CLIENTS_TABLE, [])
     if isinstance(raw, dict):
-        for cid, data in raw.items():
-            entry = {"clientId": cid}
-            if isinstance(data, dict):
-                entry.update(data)
-            items.append(entry)
-    elif isinstance(raw, list):
-        items = list(raw)
-    elif raw in (None, ""):
-        items = []
-    else:
-        items = []
+        # Защита от старого формата
+        raw = [
+            {"clientId": k, **(v if isinstance(v, dict) else {})}
+            for k, v in raw.items()
+        ]
+    if not isinstance(raw, list):
+        raw = []
 
     changed = False
-    for it in items:
-        cid = it.get("clientId")
+    for it in raw:
         ud = it.setdefault("userData", {}) or {}
         ai = it.setdefault("addInfo", {}) or {}
+        cid = it.get("clientId", "")
 
-        # Гарантируем clientName
         if "clientName" not in ud:
-            name_src = ai.get("email") or f"XRAY-{str(cid)[:8]}"
-            ud["clientName"] = name_src
+            ud["clientName"] = f"XRAY-{str(cid)[:8]}"
             changed = True
-
-        # Гарантируем creationDate
         if "creationDate" not in ud:
             ud["creationDate"] = _ctime_like()
             changed = True
 
-        # Обязательные поля addInfo
-        ai.setdefault("type", kind)
-        ai.setdefault("uuid", cid)
+        ai.setdefault("type", "xray")
+        ai.setdefault("uuid", ai.get("uuid") or cid)
         ai.setdefault("owner_tid", None)
         ai.setdefault("email", ai.get("email"))
-        ai.setdefault("created_at", _now_iso())
-        ai.setdefault("deleted", False)
-        ai.setdefault("deleted_at", None)
+        ai.setdefault("created_at", ai.get("created_at") or _now_iso())
         ai.setdefault("source", "bot")
         ai.setdefault("notes", "")
-
         it["userData"] = ud
         it["addInfo"] = ai
 
     if changed:
-        log.info({"event": "xray_clientsTable_normalized_in_mem", "added_fields": True})
+        try:
+            _write_json(XRAY_CONTAINER, CLIENTS_TABLE, raw)
+        except Exception as e:
+            log.warning({"event": "xray_clientsTable_autofix_failed", "err": str(e)})
+    return raw
 
-    return items
+
+def _write_clients_table(items: List[Dict[str, Any]]) -> None:
+    _write_json(XRAY_CONTAINER, CLIENTS_TABLE, items)
+
+
+def _listen_port() -> Optional[int]:
+    srv = _read_json(XRAY_CONTAINER, XRAY_SERVER_JSON, {})
+    try:
+        inb = (srv.get("inbounds") or [])[0]
+        return int(inb.get("port"))
+    except Exception:
+        return None
+
+
+def facts() -> dict:
+    return {"listen_port": _listen_port(), "count_profiles": len(_read_clients_table())}
+
+
+def list_profiles() -> List[dict]:
+    items = _read_clients_table()
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        cid = it.get("clientId", "")
+        ud = it.get("userData", {}) or {}
+        ai = it.get("addInfo", {}) or {}
+        out.append(
+            {
+                "uuid": ai.get("uuid") or cid,
+                "clientId": cid,
+                "name": ud.get("clientName"),
+                "owner_tid": ai.get("owner_tid"),
+                "userData": ud,
+                "addInfo": ai,
+            }
+        )
+    return out
 
 
 def _name_in_use_for_owner(owner_tid: int, name: str) -> bool:
@@ -127,188 +138,130 @@ def _name_in_use_for_owner(owner_tid: int, name: str) -> bool:
     for p in list_profiles():
         if p.get("owner_tid") != owner_tid:
             continue
-        if p.get("deleted"):
-            continue
-        # XRAY-репозиторий проверяет только XRAY-профили (этот файл)
-        pname = (p.get("name") or "").strip().lower()
-        if pname == name_norm:
+        if (p.get("name") or "").strip().lower() == name_norm:
             return True
     return False
 
 
-# ===== public API for bot =====
-
-
-def facts() -> Dict[str, Any]:
-    """Основные сведения о сервере XRAY (порт + кол-во профилей)."""
-    server = _read_json_from_container(XRAY_CONFIG_PATH) or {}
-    port = None
-    inbounds = server.get("inbounds")
-    if isinstance(inbounds, list) and inbounds:
-        try:
-            port = inbounds[0].get("port")
-        except Exception:
-            port = None
-
-    ct_raw = _read_json_from_container(CLIENTS_TABLE)
-    ct = _normalize_to_list(ct_raw, "xray")
-    return {"listen_port": port, "count_profiles": len(ct)}
-
-
-def list_profiles() -> List[Dict[str, Any]]:
-    """Возвращает список профилей XRAY в нормализованном виде."""
-    ct_raw = _read_json_from_container(CLIENTS_TABLE)
-    items = _normalize_to_list(ct_raw, "xray")
-    profiles: List[Dict[str, Any]] = []
-    for it in items:
-        cid = it.get("clientId")
-        ud = it.get("userData", {}) or {}
-        ai = it.get("addInfo", {}) or {}
-        profiles.append(
-            {
-                "uuid": ai.get("uuid") or cid,
-                "clientId": cid,
-                "name": ud.get("clientName"),
-                "email": ai.get("email"),
-                "owner_tid": ai.get("owner_tid"),
-                "deleted": bool(ai.get("deleted")),
-                "addInfo": ai,
-                "userData": ud,
-            }
-        )
-    return profiles
-
-
-def find_user(tg_id: int, name: str) -> Optional[Dict[str, Any]]:
-    """Поиск профиля по Telegram ID и имени (активного, не deleted)."""
-    name = (name or "").strip()
-    if not name:
-        return None
-    for p in list_profiles():
-        if (
-            (p.get("owner_tid") == tg_id)
-            and (p.get("name") == name)
-            and not p.get("deleted")
-        ):
-            return p
-    return None
-
-
 def add_user(tg_id: int, name: str) -> Dict[str, Any]:
-    """Создание нового XRAY пользователя (запись только в clientsTable)."""
-    # нормализация имени (обрежем пробелы)
     name = (name or "").strip()
-    # запрет дубликатов для одного owner_tid
     if _name_in_use_for_owner(int(tg_id), name):
         raise ValueError(f"Имя «{name}» уже занято среди ваших XRAY-профилей")
-    raw = _read_json_from_container(CLIENTS_TABLE)
-    items = _normalize_to_list(raw, "xray")
 
-    import uuid as _uuid
-
-    new_uuid = str(_uuid.uuid4())
-    client_id = new_uuid  # XRAY: clientId == UUID
+    items = _read_clients_table()
+    new_uuid = str(uuidlib.uuid4())
+    client_id = new_uuid  # для XRAY clientId == uuid
 
     record = {
         "clientId": client_id,
         "userData": {
-            # сохраняем человекочитаемое имя
             "clientName": (name or f"XRAY-{new_uuid[:8]}"),
             "creationDate": _ctime_like(),
         },
         "addInfo": {
             "type": "xray",
             "uuid": new_uuid,
-            "owner_tid": tg_id,
-            "email": f"{tg_id}-{(name or '').strip().replace(' ', '_')}",
+            "owner_tid": int(tg_id),
+            "email": f"{int(tg_id)}-{(name or '').strip().replace(' ', '_')}",
             "created_at": _now_iso(),
-            "deleted": False,
-            "deleted_at": None,
+            "deleted": False,  # поле оставляем для совместимости, но больше не используем
+            "deleted_at": None,  # см. ниже — удаляем физически
             "source": "bot",
             "notes": "",
         },
     }
 
     items.append(record)
-    _write_json_list(CLIENTS_TABLE, items)
-
+    _write_clients_table(items)
     return {
         "uuid": new_uuid,
         "clientId": client_id,
         "email": record["addInfo"]["email"],
-        "name": name,
-        "port": facts().get("listen_port"),
+        "name": record["userData"]["clientName"],
+        "port": _listen_port(),
     }
 
 
+def find_user(tg_id: int, name: str) -> Optional[dict]:
+    name_norm = (name or "").strip().lower()
+    for p in list_profiles():
+        if p.get("owner_tid") != int(tg_id):
+            continue
+        if (p.get("name") or "").strip().lower() == name_norm:
+            return p
+    return None
+
+
 def remove_user_by_name(tg_id: int, name: str) -> bool:
-    """Полное удаление записи XRAY из clientsTable по имени и owner_tid.
-    Раньше было soft-delete (deleted=true), теперь — жёсткое удаление.
-    Возвращает True, если хотя бы одна запись была удалена.
-    """
-    raw = _read_json_from_container(CLIENTS_TABLE)
-    items = _normalize_to_list(raw, "xray")
-
-    name = (name or "").strip()
-    if not name:
-        return False
-
-    before = len(items)
-    kept: List[Dict[str, Any]] = []
+    name_norm = (name or "").strip().lower()
+    items = _read_clients_table()
+    new_items = []
+    changed = False
     for it in items:
-        ud = it.get("userData", {}) or {}
         ai = it.get("addInfo", {}) or {}
-        # сохраняем только те, кто НЕ совпадает с (owner_tid, name)
-        if not (ai.get("owner_tid") == tg_id and (ud.get("clientName") or "").strip() == name):
-            kept.append(it)
+        ud = it.get("userData", {}) or {}
+        if (
+            ai.get("owner_tid") == int(tg_id)
+            and (ud.get("clientName") or "").strip().lower() == name_norm
+        ):
+            changed = True
+            continue  # физическое удаление
+        new_items.append(it)
+    if changed:
+        _write_clients_table(new_items)
+    return changed
 
-    if len(kept) != before:
-        _write_json_list(CLIENTS_TABLE, kept)
-        return True
-    return False
 
-
-# ===== совместимость с интерфейсом бота =====
-
-
-def find_profile_by_uuid(uuid_str: str):
+# Совместимость для бота
+def find_profile_by_uuid(uuid_str: str) -> Optional[dict]:
     return next((p for p in list_profiles() if p.get("uuid") == uuid_str), None)
 
 
 def create_profile(d: dict) -> str:
-    """
-    Совместимый вход: {'owner_tid': <int|str|None>, 'name': <str|None>}
-    Возвращает uuid созданного XRAY-клиента.
-    """
-    raw_tid = d.get("owner_tid", 0)
-    try:
-        tg_id = (
-            int(raw_tid) if raw_tid is not None and str(raw_tid).strip() != "" else 0
-        )
-    except Exception:
-        tg_id = 0
-    name = (d.get("name") or "").strip()
-    return add_user(tg_id, name).get("uuid")
+    res = add_user(int(d.get("owner_tid")), d.get("name"))
+    return res.get("uuid")
 
 
-def delete_profile_by_uuid(uuid_str: str) -> bool:
-    """Полное удаление XRAY-профиля по UUID/ClientId из clientsTable.
-    Совместимость с интерфейсом бота: возвращает True, если удалили хотя бы одну запись.
-    """
-    raw = _read_json_from_container(CLIENTS_TABLE)
-    items = _normalize_to_list(raw, "xray")
-
-    before = len(items)
-    kept: List[Dict[str, Any]] = []
+def delete_profile_by_uuid(_uuid: str) -> bool:
+    # XRay: удаление по имени удобнее, но поддержим по uuid
+    items = _read_clients_table()
+    new_items = []
+    changed = False
     for it in items:
         ai = it.get("addInfo", {}) or {}
-        cid = it.get("clientId")
-        # считаем совпадением либо addInfo.uuid, либо сам clientId
-        if (ai.get("uuid") == uuid_str) or (cid == uuid_str):
-            continue  # удаляем
-        kept.append(it)
+        if ai.get("uuid") == _uuid:
+            changed = True
+            continue
+        new_items.append(it)
+    if changed:
+        _write_clients_table(new_items)
+    return changed
 
-    if len(kept) != before:
-        _write_json_list(CLIENTS_TABLE, kept)
-        return True
-    return False
+
+# ===== экспорт клиентского «конфига» =====
+
+
+def render_client_config(uuid: str) -> str:
+    """Отдаёт JSON-сниппет для клиента XRAY (vless), без сетевого хоста."""
+    prof = find_profile_by_uuid(uuid)
+    if not prof:
+        raise ValueError("Profile not found")
+
+    port = _listen_port()
+    email = (prof.get("addInfo") or {}).get("email")
+    cid = prof.get("clientId")
+
+    obj = {
+        "protocol": "vless",
+        "uuid": cid,
+        "email": email,
+        "server": {
+            "host": "<SERVER_HOST>",  # заполни ботом/оператором
+            "port": port or 443,
+        },
+        "transport": {
+            "type": "tcp",  # при желании можно читать из server.json
+            "security": "tls",
+        },
+    }
+    return json.dumps(obj, ensure_ascii=False, indent=2) + "\n"
