@@ -1,11 +1,13 @@
 # src/core/repo_xray.py
 # ЕДИНЫЙ слой предметной логики для XRAY.
 # Работает напрямую с файлами внутри контейнера amnezia-xray через services.util.
+
 from __future__ import annotations
 
 import json
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
+
 from services.logger_setup import get_logger
 from services.util import (
     docker_read_file,
@@ -23,6 +25,7 @@ CLIENTS_TABLE = "/opt/amnezia/xray/clientsTable"
 
 
 def _now_iso() -> str:
+    """Возвращает ISO-8601 UTC без микросекунд, с суффиксом 'Z'."""
     return (
         datetime.now(timezone.utc)
         .replace(microsecond=0)
@@ -32,12 +35,12 @@ def _now_iso() -> str:
 
 
 def _ctime_like() -> str:
-    # "Mon Nov 10 08:35:32 2025"
+    """Формат времени в стиле: Mon Nov 10 08:35:32 2025."""
     return datetime.now(timezone.utc).strftime("%a %b %d %H:%M:%S %Y")
 
 
 def _read_json_from_container(path: str) -> Optional[Any]:
-    """Прочитать JSON из контейнера, не падать, если файла нет/пустой/битый."""
+    """Прочитать JSON из контейнера, не падать, если файла нет/битый."""
     try:
         txt = docker_read_file(XRAY_CONTAINER, path)
     except Exception as e:
@@ -53,18 +56,17 @@ def _read_json_from_container(path: str) -> Optional[Any]:
 
 
 def _write_json_list(path: str, items: List[Dict[str, Any]]) -> None:
-    """Пишем ВСЕГДА как массив объектов (совместимо со сторонним UI)."""
-    docker_write_file_atomic(
-        XRAY_CONTAINER, path, json.dumps(items, ensure_ascii=False, indent=2)
-    )
+    """Пишем строго как массив объектов (совместимо со сторонним UI)."""
+    payload = json.dumps(items, ensure_ascii=False, indent=2)
+    docker_write_file_atomic(XRAY_CONTAINER, path, payload)
 
 
 def _normalize_to_list(raw: Any, kind: str = "xray") -> List[Dict[str, Any]]:
     """
-    Приводим к массиву:
-      - dict {"id": {...}} -> [{"clientId": "id", ...}]
-      - list оставляем как есть
-    Заодно гарантируем userData.clientName/creationDate и addInfo.* каркас.
+    Приводим данные к массиву и гарантируем наличие обязательных полей.
+    Поддерживаем две формы исходника:
+      - dict { "<clientId>": { ... }, ... }
+      - list [ { "clientId": "...", ... }, ... ]
     """
     items: List[Dict[str, Any]] = []
 
@@ -79,34 +81,26 @@ def _normalize_to_list(raw: Any, kind: str = "xray") -> List[Dict[str, Any]]:
     elif raw in (None, ""):
         items = []
     else:
-        # неизвестное — начнем с пустого
         items = []
 
     changed = False
     for it in items:
-        # поля
         cid = it.get("clientId")
         ud = it.setdefault("userData", {}) or {}
         ai = it.setdefault("addInfo", {}) or {}
 
-        # имя: приоритезируем clientName; если нет — синтез
+        # Гарантируем clientName
         if "clientName" not in ud:
-            name_src = ud.get("name") or ai.get("email")
-            if not name_src:
-                # короткий fallback по UUID
-                name_src = f"XR-{str(cid)[:8]}"
+            name_src = ai.get("email") or f"XRAY-{str(cid)[:8]}"
             ud["clientName"] = name_src
             changed = True
-        # убрать legacy userData.name
-        if "name" in ud:
-            ud.pop("name", None)
-            changed = True
 
+        # Гарантируем creationDate
         if "creationDate" not in ud:
             ud["creationDate"] = _ctime_like()
             changed = True
 
-        # addInfo каркас
+        # Обязательные поля addInfo
         ai.setdefault("type", kind)
         ai.setdefault("uuid", cid)
         ai.setdefault("owner_tid", None)
@@ -120,11 +114,9 @@ def _normalize_to_list(raw: Any, kind: str = "xray") -> List[Dict[str, Any]]:
         it["userData"] = ud
         it["addInfo"] = ai
 
-    # Возможна сортировка по created_at для детерминизма (не обязательно)
-    # items.sort(key=lambda x: (x.get("addInfo", {}).get("created_at") or "", x.get("clientId") or ""))
-
     if changed:
         log.info({"event": "xray_clientsTable_normalized_in_mem", "added_fields": True})
+
     return items
 
 
@@ -132,6 +124,7 @@ def _normalize_to_list(raw: Any, kind: str = "xray") -> List[Dict[str, Any]]:
 
 
 def facts() -> Dict[str, Any]:
+    """Основные сведения о сервере XRAY (порт + кол-во профилей)."""
     server = _read_json_from_container(XRAY_CONFIG_PATH) or {}
     port = None
     inbounds = server.get("inbounds")
@@ -147,6 +140,7 @@ def facts() -> Dict[str, Any]:
 
 
 def list_profiles() -> List[Dict[str, Any]]:
+    """Возвращает список профилей XRAY в нормализованном виде."""
     ct_raw = _read_json_from_container(CLIENTS_TABLE)
     items = _normalize_to_list(ct_raw, "xray")
     profiles: List[Dict[str, Any]] = []
@@ -170,6 +164,7 @@ def list_profiles() -> List[Dict[str, Any]]:
 
 
 def find_user(tg_id: int, name: str) -> Optional[Dict[str, Any]]:
+    """Поиск профиля по Telegram ID и имени (активного, не deleted)."""
     name = (name or "").strip()
     if not name:
         return None
@@ -184,7 +179,7 @@ def find_user(tg_id: int, name: str) -> Optional[Dict[str, Any]]:
 
 
 def add_user(tg_id: int, name: str) -> Dict[str, Any]:
-    # читаем и нормализуем к списку
+    """Создание нового XRAY пользователя (запись только в clientsTable)."""
     raw = _read_json_from_container(CLIENTS_TABLE)
     items = _normalize_to_list(raw, "xray")
 
@@ -196,14 +191,15 @@ def add_user(tg_id: int, name: str) -> Dict[str, Any]:
     record = {
         "clientId": client_id,
         "userData": {
-            "clientName": name,
+            # сохраняем человекочитаемое имя
+            "clientName": (name or f"XRAY-{new_uuid[:8]}"),
             "creationDate": _ctime_like(),
         },
         "addInfo": {
             "type": "xray",
             "uuid": new_uuid,
             "owner_tid": tg_id,
-            "email": f"{tg_id}-{name}",
+            "email": f"{tg_id}-{(name or '').strip().replace(' ', '_')}",
             "created_at": _now_iso(),
             "deleted": False,
             "deleted_at": None,
@@ -225,6 +221,7 @@ def add_user(tg_id: int, name: str) -> Dict[str, Any]:
 
 
 def remove_user_by_name(tg_id: int, name: str) -> bool:
+    """Логическое удаление пользователя по имени (soft-delete)."""
     raw = _read_json_from_container(CLIENTS_TABLE)
     items = _normalize_to_list(raw, "xray")
 
@@ -247,9 +244,43 @@ def remove_user_by_name(tg_id: int, name: str) -> bool:
     return changed
 
 
-# совместимость некоторых вызовов (бот местами ожидает эти имена)
-find_profile_by_uuid = lambda uuid_str: next(
-    (p for p in list_profiles() if p.get("uuid") == uuid_str), None
-)
-create_profile = lambda d: add_user(int(d.get("owner_tid")), d.get("name")).get("uuid")
-delete_profile_by_uuid = lambda u: False  # не используется для xray
+# ===== совместимость с интерфейсом бота =====
+
+
+def find_profile_by_uuid(uuid_str: str):
+    return next((p for p in list_profiles() if p.get("uuid") == uuid_str), None)
+
+
+def create_profile(d: dict) -> str:
+    """
+    Совместимый вход: {'owner_tid': <int|str|None>, 'name': <str|None>}
+    Возвращает uuid созданного XRAY-клиента.
+    """
+    raw_tid = d.get("owner_tid", 0)
+    try:
+        tg_id = (
+            int(raw_tid) if raw_tid is not None and str(raw_tid).strip() != "" else 0
+        )
+    except Exception:
+        tg_id = 0
+    name = (d.get("name") or "").strip()
+    return add_user(tg_id, name).get("uuid")
+
+
+def delete_profile_by_uuid(uuid_str: str) -> bool:
+    """
+    XRAY — софт-делит по UUID (для единообразия API с AWG).
+    """
+    raw = _read_json_from_container(CLIENTS_TABLE)
+    items = _normalize_to_list(raw, "xray")
+    changed = False
+    for it in items:
+        ai = it.get("addInfo", {}) or {}
+        if (ai.get("uuid") or it.get("clientId")) == uuid_str and not ai.get("deleted"):
+            ai["deleted"] = True
+            ai["deleted_at"] = _now_iso()
+            it["addInfo"] = ai
+            changed = True
+    if changed:
+        _write_json_list(CLIENTS_TABLE, items)
+    return changed
