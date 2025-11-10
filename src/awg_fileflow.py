@@ -103,7 +103,9 @@ ENV_OBF_DEFAULTS = {
 
 def _sh(cmd: str, timeout: int = 15) -> Tuple[int, str, str]:
     """Run a command inside the AWG container."""
-    full = f"docker exec {AWG_CONTAINER} sh -lc {repr(cmd)}"
+    # Use double quotes around the whole command; escape internal double quotes and backslashes
+    safe = cmd.replace("\\", "\\\\").replace('"', '\\"')
+    full = f'docker exec {AWG_CONTAINER} sh -lc "{safe}"'
     rc, out, err = run_cmd(full, timeout=timeout)
     return rc, (out or ""), (err or "")
 
@@ -257,7 +259,8 @@ def shared_psk() -> str:
 def get_dns_ip() -> str:
     """Return amnezia-dns IP if available (inside AWG container), otherwise 1.1.1.1."""
     try:
-        rc, out, _ = _sh("getent hosts amnezia-dns 2>/dev/null | awk '{print $1}' | head -n1", timeout=5)
+        # Use POSIX set -- to split by IFS and read first field (IP)
+        rc, out, _ = _sh("set -- $(getent hosts amnezia-dns 2>/dev/null); [ -n \"$1\" ] && echo $1 || true", timeout=5)
         ip = (out or "").strip()
         if ip and ip.count(".") == 3:
             return ip
