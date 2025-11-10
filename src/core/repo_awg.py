@@ -49,8 +49,10 @@ def _write_json_to_container(path: str, data: Any) -> None:
 
 
 def _wg_dump() -> List[str]:
-    rc, out, err = docker_exec(AWG_CONTAINER, "wg show wg0 dump")
+    # Use shell to ensure PATH is correct inside container
+    rc, out, err = docker_exec(AWG_CONTAINER, 'sh -lc "wg show wg0 dump"')
     if rc != 0:
+        log.warning({"event": "docker_exec_failed", "container": AWG_CONTAINER, "cmd": "wg show wg0 dump", "rc": rc, "err": err})
         return []
     return out.strip().splitlines()
 
@@ -147,11 +149,13 @@ def _ensure_clients_table_dict() -> Dict[str, Any]:
 
 
 def _gen_wg_keypair() -> (str, str):
-    rc, priv, err = docker_exec(AWG_CONTAINER, "wg genkey")
+    # Run via shell to have proper PATH in BusyBox-based image
+    rc, priv, err = docker_exec(AWG_CONTAINER, 'sh -lc "wg genkey"')
     if rc != 0:
+        log.error({"event": "docker_exec_failed", "container": AWG_CONTAINER, "cmd": "wg genkey", "rc": rc, "err": err})
         raise RuntimeError(f"wg genkey failed: {err}")
     rc, pub, err = docker_exec(
-        AWG_CONTAINER, f"printf %s {shq(priv.strip())} | wg pubkey"
+        AWG_CONTAINER, 'sh -lc "printf %s ' + shq(priv.strip()) + ' | wg pubkey"'
     )
     if rc != 0:
         raise RuntimeError(f"wg pubkey failed: {err}")
@@ -159,7 +163,7 @@ def _gen_wg_keypair() -> (str, str):
 
 
 def _gen_psk() -> str:
-    rc, out, err = docker_exec(AWG_CONTAINER, "wg genpsk")
+    rc, out, err = docker_exec(AWG_CONTAINER, 'sh -lc "wg genpsk"')
     if rc != 0:
         raise RuntimeError(f"wg genpsk failed: {err}")
     return out.strip()
