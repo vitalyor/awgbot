@@ -207,6 +207,22 @@ def _get_next_ip(clients: List[Dict[str, Any]], subnet_cidr: str) -> str:
     raise RuntimeError("No available IPs in subnet")
 
 
+def _name_in_use_for_owner(owner_tid: int, name: str) -> bool:
+    if not name:
+        return False
+    name_norm = " ".join(name.split()).lower()
+    for p in list_profiles():
+        if p.get("owner_tid") != owner_tid:
+            continue
+        if p.get("deleted"):
+            continue
+        # AWG-репозиторий проверяет только AWG-профили (этот файл)
+        pname = (p.get("name") or "").strip().lower()
+        if pname == name_norm:
+            return True
+    return False
+
+
 def facts() -> dict:
     """Извлекает параметры интерфейса из wg0.conf внутри контейнера."""
     port = None
@@ -318,6 +334,11 @@ def _sync_wg_conf_from_table() -> None:
 
 def create_profile(profile_data: dict) -> str:
     """Создаёт новый профиль AWG и добавляет его в clientsTable."""
+    owner_tid = int(profile_data.get("owner_tid") or 0)
+    name = (profile_data.get("name") or "").strip()
+
+    if _name_in_use_for_owner(owner_tid, name):
+        raise ValueError(f"Имя «{name}» уже занято среди ваших AWG-профилей")
     clients = _read_clients_table()
     f = facts()
     subnet = f.get("subnet") or "10.8.0.0/24"

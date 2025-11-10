@@ -120,6 +120,22 @@ def _normalize_to_list(raw: Any, kind: str = "xray") -> List[Dict[str, Any]]:
     return items
 
 
+def _name_in_use_for_owner(owner_tid: int, name: str) -> bool:
+    if not name:
+        return False
+    name_norm = " ".join(name.split()).lower()
+    for p in list_profiles():
+        if p.get("owner_tid") != owner_tid:
+            continue
+        if p.get("deleted"):
+            continue
+        # XRAY-репозиторий проверяет только XRAY-профили (этот файл)
+        pname = (p.get("name") or "").strip().lower()
+        if pname == name_norm:
+            return True
+    return False
+
+
 # ===== public API for bot =====
 
 
@@ -180,6 +196,11 @@ def find_user(tg_id: int, name: str) -> Optional[Dict[str, Any]]:
 
 def add_user(tg_id: int, name: str) -> Dict[str, Any]:
     """Создание нового XRAY пользователя (запись только в clientsTable)."""
+    # нормализация имени (обрежем пробелы)
+    name = (name or "").strip()
+    # запрет дубликатов для одного owner_tid
+    if _name_in_use_for_owner(int(tg_id), name):
+        raise ValueError(f"Имя «{name}» уже занято среди ваших XRAY-профилей")
     raw = _read_json_from_container(CLIENTS_TABLE)
     items = _normalize_to_list(raw, "xray")
 
