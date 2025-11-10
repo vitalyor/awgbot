@@ -1,154 +1,217 @@
-import os
-import json
-import subprocess
-import datetime
-import uuid
-import shutil
-import tempfile
+# src/core/repo_xray.py
+# ЕДИНЫЙ слой предметной логики для XRAY.
+# Работает напрямую с файлами внутри контейнера amnezia-xray через services.util.
 
+from __future__ import annotations
+import json
+from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone
 from services.logger_setup import get_logger
+from services.util import (
+    docker_read_file,
+    docker_write_file_atomic,
+    XRAY_CONTAINER,
+    XRAY_CONFIG_PATH,
+)
+
 log = get_logger("core.repo_xray")
 
-XRAY_DIR = "/opt/amnezia/xray"
-SERVER_JSON = os.path.join(XRAY_DIR, "server.json")
-CLIENTS_TABLE = os.path.join(XRAY_DIR, "clientsTable")
+CLIENTS_TABLE = "/opt/amnezia/xray/clientsTable"
 
 
-def _read_json(path):
+# ===== helpers =====
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _read_json_from_container(path: str) -> Optional[Any]:
+    txt = docker_read_file(XRAY_CONTAINER, path)
+    if txt is None or txt.strip() == "":
+        return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        log.warning(f"Failed to read JSON {path}: {e}")
+        return json.loads(txt)
+    except json.JSONDecodeError as e:
+        log.warning({"event": "xray_json_decode_fail", "path": path, "err": str(e)})
         return None
 
 
-def _write_json_atomic(path, data):
-    log.debug(f"Writing JSON atomically to {path}")
-    dir_name = os.path.dirname(path)
-    with tempfile.NamedTemporaryFile("w", delete=False, dir=dir_name, encoding="utf-8") as tf:
-        json.dump(data, tf, indent=2, ensure_ascii=False)
-        tempname = tf.name
-    os.replace(tempname, path)
+def _write_json_to_container(path: str, data: Any) -> None:
+    docker_write_file_atomic(
+        XRAY_CONTAINER, path, json.dumps(data, ensure_ascii=False, indent=2)
+    )
 
 
-def _backup_file(path):
-    if os.path.exists(path):
-        timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-        backup_path = f"{path}.bak-{timestamp}"
-        shutil.copy2(path, backup_path)
-        log.info(f"Backup created: {backup_path}")
+# ===== public API for bot =====
 
 
-def list_profiles():
-    clients = _read_json(CLIENTS_TABLE)
-    if not clients:
-        return []
-    profiles = []
-    for clientId, data in clients.items():
-        addInfo = data.get("addInfo", {})
-        userData = data.get("userData", {})
-        profile = {
-            "uuid": addInfo.get("uuid"),
-            "clientId": clientId,
-            "name": userData.get("name"),
-            "email": userData.get("email"),
-            "deleted": data.get("deleted", False),
-            "owner_tid": addInfo.get("owner_tid"),
-        }
-        profiles.append(profile)
+def facts() -> Dict[str, Any]:
+    server = _read_json_from_container(XRAY_CONFIG_PATH) or {}
+    port = None
+    inbounds = server.get("inbounds")
+    if isinstance(inbounds, list) and inbounds:
+        try:
+            port = inbounds[0].get("port")
+        except Exception:
+            port = None
+
+    ct = _read_json_from_container(CLIENTS_TABLE)
+    if isinstance(ct, list):
+        count_profiles = len(ct)
+    elif isinstance(ct, dict):
+        count_profiles = len(ct)
+    else:
+        count_profiles = 0
+
+    return {"listen_port": port, "count_profiles": count_profiles}
+
+
+def list_profiles() -> List[Dict[str, Any]]:
+    ct = _read_json_from_container(CLIENTS_TABLE)
+    profiles: List[Dict[str, Any]] = []
+    if isinstance(ct, list):
+        # legacy array
+        for item in ct:
+            cid = item.get("clientId")
+            ud = item.get("userData", {}) or {}
+            ai = item.get("addInfo", {}) or {}
+            profiles.append(
+                {
+                    "uuid": ai.get("uuid") or cid,
+                    "clientId": cid,
+                    "name": ud.get("name") or ud.get("clientName"),
+                    "email": ud.get("email") or ai.get("email"),
+                    "owner_tid": ai.get("owner_tid"),
+                    "deleted": bool(ai.get("deleted") or item.get("deleted")),
+                    "addInfo": ai,
+                    "userData": ud,
+                }
+            )
+    elif isinstance(ct, dict):
+        for cid, data in ct.items():
+            data = data or {}
+            ud = data.get("userData", {}) or {}
+            ai = data.get("addInfo", {}) or {}
+            profiles.append(
+                {
+                    "uuid": ai.get("uuid") or cid,
+                    "clientId": cid,
+                    "name": ud.get("name") or ud.get("clientName"),
+                    "email": ud.get("email") or ai.get("email"),
+                    "owner_tid": ai.get("owner_tid"),
+                    "deleted": bool(ai.get("deleted") or data.get("deleted")),
+                    "addInfo": ai,
+                    "userData": ud,
+                }
+            )
     return profiles
 
 
-def find_profile_by_uuid(uuid_str):
-    clients = _read_json(CLIENTS_TABLE)
-    if not clients:
+def find_user(tg_id: int, name: str) -> Optional[Dict[str, Any]]:
+    name = (name or "").strip()
+    if not name:
         return None
-    for clientId, data in clients.items():
-        addInfo = data.get("addInfo", {})
-        if addInfo.get("uuid") == uuid_str:
-            userData = data.get("userData", {})
-            profile = {
-                "uuid": addInfo.get("uuid"),
-                "clientId": clientId,
-                "name": userData.get("name"),
-                "email": userData.get("email"),
-                "deleted": data.get("deleted", False),
-                "owner_tid": addInfo.get("owner_tid"),
-            }
-            return profile
+    for p in list_profiles():
+        if (
+            (p.get("owner_tid") == tg_id)
+            and (p.get("name") == name)
+            and not p.get("deleted")
+        ):
+            return p
     return None
 
 
-def create_profile(profile_data):
-    log.info(f"Creating new Xray profile for {profile_data.get('name')} (owner_tid={profile_data.get('owner_tid')})")
-    clients = _read_json(CLIENTS_TABLE)
-    if clients is None:
-        clients = {}
+def add_user(tg_id: int, name: str) -> Dict[str, Any]:
+    # clientsTable — источник истины по XRAY профилям
+    ct = _read_json_from_container(CLIENTS_TABLE)
+    if ct is None:
+        ct = {}
+    if isinstance(ct, list):
+        # миграция legacy списка к dict
+        migrated: Dict[str, Any] = {}
+        for it in ct:
+            cid = it.get("clientId") or it.get("uuid")
+            if cid:
+                migrated[cid] = {k: v for k, v in it.items() if k != "clientId"}
+        ct = migrated
 
-    new_uuid = str(uuid.uuid4())
-    clientId = profile_data.get("clientId") or str(uuid.uuid4())
-    userData = {
-        "name": profile_data.get("name"),
-        "email": profile_data.get("email"),
-    }
-    addInfo = {
-        "uuid": new_uuid,
-        "owner_tid": profile_data.get("owner_tid"),
-    }
-    new_profile = {
-        "userData": userData,
-        "addInfo": addInfo,
-    }
-    clients[clientId] = new_profile
-    _write_json_atomic(CLIENTS_TABLE, clients)
+    import uuid as _uuid
 
-    log.info(f"Created Xray profile {new_uuid} for {profile_data.get('name')}")
+    new_uuid = str(_uuid.uuid4())
+    client_id = new_uuid  # для XRAY clientId == UUID
+
+    record = {
+        "userData": {
+            "name": name,
+            "email": f"{tg_id}-{name}",
+        },
+        "addInfo": {
+            "type": "xray",
+            "uuid": new_uuid,
+            "owner_tid": tg_id,
+            "email": f"{tg_id}-{name}",
+            "created_at": _now_iso(),
+            "deleted": False,
+            "deleted_at": None,
+            "source": "bot",
+            "notes": "",
+        },
+    }
+    ct[client_id] = record
+    _write_json_to_container(CLIENTS_TABLE, ct)
+
     return {
         "uuid": new_uuid,
-        "clientId": clientId,
-        "name": userData.get("name"),
-        "email": userData.get("email"),
-        "deleted": False,
-        "owner_tid": addInfo.get("owner_tid"),
+        "clientId": client_id,
+        "email": record["userData"]["email"],
+        "name": name,
+        "port": facts().get("listen_port"),
     }
 
 
-def delete_profile_by_uuid(uuid_str):
-    clients = _read_json(CLIENTS_TABLE)
-    if not clients:
+def remove_user_by_name(tg_id: int, name: str) -> bool:
+    ct = _read_json_from_container(CLIENTS_TABLE)
+    if not isinstance(ct, (dict, list)):
         return False
-    found = False
-    for clientId, data in clients.items():
-        addInfo = data.get("addInfo", {})
-        if addInfo.get("uuid") == uuid_str:
-            if data.get("deleted", False):
-                # Already deleted
-                log.warning(f"Profile {uuid_str} already marked deleted")
-                return False
-            data["deleted"] = True
-            data["deleted_at"] = datetime.datetime.utcnow().isoformat() + "Z"
-            clients[clientId] = data
-            found = True
+
+    changed = False
+    if isinstance(ct, list):
+        for it in ct:
+            ai = it.get("addInfo", {}) or {}
+            ud = it.get("userData", {}) or {}
+            uname = ud.get("name") or ud.get("clientName")
+            if ai.get("owner_tid") == tg_id and uname == name and not ai.get("deleted"):
+                ai["deleted"] = True
+                ai["deleted_at"] = _now_iso()
+                it["addInfo"] = ai
+                changed = True
+        if changed:
+            _write_json_to_container(CLIENTS_TABLE, ct)
+        return changed
+
+    # dict
+    for cid, data in ct.items():
+        data = data or {}
+        ai = data.get("addInfo", {}) or {}
+        ud = data.get("userData", {}) or {}
+        uname = ud.get("name") or ud.get("clientName")
+        if ai.get("owner_tid") == tg_id and uname == name and not ai.get("deleted"):
+            ai["deleted"] = True
+            ai["deleted_at"] = _now_iso()
+            data["addInfo"] = ai
+            ct[cid] = data
+            changed = True
             break
-    if not found:
-        return False
-    log.info(f"Profile {uuid_str} marked deleted")
-    _backup_file(CLIENTS_TABLE)
-    _write_json_atomic(CLIENTS_TABLE, clients)
-    return True
+
+    if changed:
+        _write_json_to_container(CLIENTS_TABLE, ct)
+    return changed
 
 
-def facts():
-    server_data = _read_json(SERVER_JSON)
-    listen_port = None
-    if server_data:
-        inbounds = server_data.get("inbounds")
-        if inbounds and isinstance(inbounds, list) and len(inbounds) > 0:
-            listen_port = inbounds[0].get("port")
-    clients = _read_json(CLIENTS_TABLE)
-    count_profiles = len(clients) if clients else 0
-    return {
-        "listen_port": listen_port,
-        "count_profiles": count_profiles,
-    }
+# совместимость некоторых вызовов
+find_profile_by_uuid = lambda uuid_str: next(
+    (p for p in list_profiles() if p.get("uuid") == uuid_str), None
+)
+create_profile = lambda d: add_user(int(d.get("owner_tid")), d.get("name")).get("uuid")
+delete_profile_by_uuid = lambda u: False  # не используется для xray

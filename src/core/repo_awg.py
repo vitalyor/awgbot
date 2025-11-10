@@ -1,244 +1,355 @@
-import os
+# src/core/repo_awg.py
+# ЕДИНЫЙ слой предметной логики для AWG.
+# Работает напрямую с файлами внутри контейнера amnezia-awg через services.util.
+
+from __future__ import annotations
 import json
-import subprocess
-import shutil
-import fcntl
-import uuid as uuidlib
-from typing import List, Optional
-from datetime import datetime
+import ipaddress
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timezone
+
 from services.logger_setup import get_logger
+from services.util import (
+    docker_read_file,
+    docker_write_file_atomic,
+    docker_exec,
+    shq,
+    AWG_CONTAINER,
+)
+
 log = get_logger("core.repo_awg")
 
 BASE_PATH = "/opt/amnezia/awg"
-LOCKS_PATH = os.path.join(BASE_PATH, "locks")
-BACKUP_KEEP = 5
-CLIENTS_TABLE = os.path.join(BASE_PATH, "clientsTable")
-WG_CONF = os.path.join(BASE_PATH, "wg0.conf")
+CLIENTS_TABLE = f"{BASE_PATH}/clientsTable"
+WG_CONF = f"{BASE_PATH}/wg0.conf"
 
-def _acquire_flock(path, mode):
-    """Open file and acquire exclusive flock, return file object."""
-    f = open(path, mode)
-    fcntl.flock(f, fcntl.LOCK_EX)
-    return f
 
-def _atomic_write_json(path, data):
-    tmp_path = path + ".new"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    # Backup rotation
-    for i in reversed(range(1, BACKUP_KEEP)):
-        prev = f"{path}.{i}"
-        prev_next = f"{path}.{i+1}"
-        if os.path.exists(prev):
-            os.rename(prev, prev_next)
-    if os.path.exists(path):
-        os.rename(path, f"{path}.1")
-    os.rename(tmp_path, path)
+# ===== helpers =====
 
-def _read_clients_table():
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _read_json_from_container(path: str) -> Optional[Any]:
+    txt = docker_read_file(AWG_CONTAINER, path)
+    if txt is None or txt.strip() == "":
+        return None
     try:
-        with open(CLIENTS_TABLE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log.warning(f"Failed to read clientsTable: {e}")
+        return json.loads(txt)
+    except json.JSONDecodeError as e:
+        log.warning({"event": "awg_json_decode_fail", "path": path, "err": str(e)})
+        return None
+
+
+def _write_json_to_container(path: str, data: Any) -> None:
+    docker_write_file_atomic(
+        AWG_CONTAINER, path, json.dumps(data, ensure_ascii=False, indent=2)
+    )
+
+
+def _wg_dump() -> List[str]:
+    rc, out, err = docker_exec(AWG_CONTAINER, "wg show wg0 dump")
+    if rc != 0:
         return []
+    return out.strip().splitlines()
 
-def _write_clients_table(clients_data):
-    os.makedirs(os.path.dirname(CLIENTS_TABLE), exist_ok=True)
-    # use flock to prevent concurrent writes
-    with _acquire_flock(CLIENTS_TABLE, "a+"):
-        _atomic_write_json(CLIENTS_TABLE, clients_data)
 
-def _sync_wg_conf():
-    log.debug("Regenerating wg0.conf from clientsTable...")
-    # Re-generate wg0.conf from clientsTable and call wg syncconf
-    clients = _read_clients_table()
-    # Read base config (interface section)
-    conf_lines = []
-    with open(WG_CONF, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    # Find where [Peer] sections start
-    peer_idx = None
-    for idx, line in enumerate(lines):
-        if line.strip().startswith("[Peer]"):
-            peer_idx = idx
-            break
-    if peer_idx is not None:
-        conf_lines = lines[:peer_idx]
-    else:
-        conf_lines = lines
-    # Now, append peers from clientsTable
-    for client in clients:
-        if client.get("addInfo", {}).get("deleted"):
+def _parse_interface_from_conf(conf_text: str) -> Dict[str, str]:
+    res: Dict[str, str] = {}
+    for raw in (conf_text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
             continue
-        user_data = client.get("userData", {})
-        conf_lines.append("\n[Peer]\n")
-        conf_lines.append(f"PublicKey = {client['clientId']}\n")
-        conf_lines.append(f"PresharedKey = {user_data.get('psk','')}\n")
-        conf_lines.append(f"AllowedIPs = {user_data.get('ip','')}/32\n")
-    # Write to temp conf
-    tmp_conf = WG_CONF + ".new"
-    with open(tmp_conf, "w", encoding="utf-8") as f:
-        f.writelines(conf_lines)
-        f.flush()
-        os.fsync(f.fileno())
-    # Atomically move and syncconf
-    os.rename(tmp_conf, WG_CONF)
-    subprocess.run(["wg", "syncconf", "wg0", WG_CONF], check=True)
-    log.info("wg0.conf successfully synchronized.")
+        if "=" in line:
+            k, v = [s.strip() for s in line.split("=", 1)]
+            if k in (
+                "ListenPort",
+                "Address",
+                "DNS",
+                "Endpoint",
+                "Jc",
+                "Jmin",
+                "Jmax",
+                "S1",
+                "S2",
+                "H1",
+                "H2",
+                "H3",
+                "H4",
+                "PrivateKey",
+            ):
+                res[k] = v
+    return res
 
-def _get_wg_dump():
-    try:
-        result = subprocess.run(["wg", "show", "wg0", "dump"], capture_output=True, text=True, check=True)
-        return result.stdout.strip().splitlines()
-    except subprocess.CalledProcessError:
-        return []
 
-def list_profiles() -> List[dict]:
-    clients_data = _read_clients_table()
-    wg_dump = _get_wg_dump()
-    allowed_ips_map = {}
-    for line in wg_dump[1:]:  # skip header line
-        parts = line.split('\t')
-        if len(parts) >= 5:
-            pubkey = parts[0]
-            allowed_ips = parts[4]
-            allowed_ips_map[pubkey] = allowed_ips
-    profiles = []
-    for client in clients_data:
-        client_id = client.get("clientId", "")
-        user_data = client.get("userData", {})
-        add_info = client.get("addInfo", {})
-        uuid = add_info.get("uuid", "")
-        owner_tid = add_info.get("owner_tid", "")
-        deleted = add_info.get("deleted", False)
-        name = user_data.get("clientName", "")
-        allowed_ips = allowed_ips_map.get(client_id, "(none)")
-        profile = {
-            "uuid": uuid,
-            "clientId": client_id,
-            "name": name,
-            "allowed_ips": allowed_ips,
-            "deleted": deleted,
-            "owner_tid": owner_tid,
-            "userData": user_data,
-            "addInfo": add_info,
-        }
-        profiles.append(profile)
-    return profiles
+def _build_conf_from_clients(
+    interface_kv: Dict[str, str], clients: Dict[str, Any]
+) -> str:
+    # Секция [Interface] — переносим ключевые строки как есть (без дублей)
+    lines: List[str] = []
+    lines.append("[Interface]\n")
+    for key in (
+        "PrivateKey",
+        "Address",
+        "ListenPort",
+        "Jc",
+        "Jmin",
+        "Jmax",
+        "S1",
+        "S2",
+        "H1",
+        "H2",
+        "H3",
+        "H4",
+    ):
+        if key in interface_kv:
+            lines.append(f"{key} = {interface_kv[key]}\n")
 
-def _generate_wg_keypair():
-    log.debug("Generating WireGuard keypair")
-    priv = subprocess.check_output(["wg", "genkey"]).decode().strip()
-    pub = subprocess.check_output(["wg", "pubkey"], input=priv.encode()).decode().strip()
-    return priv, pub
+    # peers из clientsTable (skip deleted)
+    for pubkey, data in (clients or {}).items():
+        ai = (data or {}).get("addInfo", {}) or {}
+        if ai.get("deleted"):
+            continue
+        ud = (data or {}).get("userData", {}) or {}
+        ip = ud.get("ip")
+        psk = ud.get("psk") or ""
+        if not ip:
+            # пропускаем битые записи
+            continue
+        lines.append("\n[Peer]\n")
+        lines.append(f"PublicKey = {pubkey}\n")
+        if psk:
+            lines.append(f"PresharedKey = {psk}\n")
+        lines.append(f"AllowedIPs = {ip}/32\n")
+        lines.append("PersistentKeepalive = 25\n")
 
-def _generate_psk():
-    log.debug("Generating preshared key")
-    return subprocess.check_output(["wg", "genpsk"]).decode().strip()
+    return "".join(lines)
 
-def _get_next_ip(clients, subnet):
-    import ipaddress
-    net = ipaddress.ip_network(subnet)
+
+def _ensure_clients_table_dict() -> Dict[str, Any]:
+    ct = _read_json_from_container(CLIENTS_TABLE)
+    if ct is None:
+        return {}
+    if isinstance(ct, list):
+        # мигрируем legacy список к dict
+        migrated: Dict[str, Any] = {}
+        for it in ct:
+            cid = it.get("clientId")
+            if cid:
+                migrated[cid] = {k: v for k, v in it.items() if k != "clientId"}
+        _write_json_to_container(CLIENTS_TABLE, migrated)
+        return migrated
+    if isinstance(ct, dict):
+        return ct
+    # что-то не то — начнём с пустого
+    return {}
+
+
+def _gen_wg_keypair() -> (str, str):
+    rc, priv, err = docker_exec(AWG_CONTAINER, "wg genkey")
+    if rc != 0:
+        raise RuntimeError(f"wg genkey failed: {err}")
+    rc, pub, err = docker_exec(
+        AWG_CONTAINER, f"printf %s {shq(priv.strip())} | wg pubkey"
+    )
+    if rc != 0:
+        raise RuntimeError(f"wg pubkey failed: {err}")
+    return priv.strip(), pub.strip()
+
+
+def _gen_psk() -> str:
+    rc, out, err = docker_exec(AWG_CONTAINER, "wg genpsk")
+    if rc != 0:
+        raise RuntimeError(f"wg genpsk failed: {err}")
+    return out.strip()
+
+
+def _occupied_ips(ct: Dict[str, Any]) -> set:
     used = set()
-    for c in clients:
-        ip = c.get("userData", {}).get("ip")
+    # из clientsTable
+    for _, data in (ct or {}).items():
+        ud = (data or {}).get("userData", {}) or {}
+        ip = ud.get("ip")
         if ip:
-            used.add(ipaddress.ip_address(ip))
-    # skip .1 (server), start from .2
-    for host in net.hosts():
-        if str(host) == str(list(net.hosts())[0]):
+            try:
+                used.add(ipaddress.ip_address(ip))
+            except Exception:
+                pass
+    # из wg dump (на всякий)
+    dump = _wg_dump()
+    for line in dump[1:]:
+        parts = line.split("\t")
+        if len(parts) >= 5 and parts[4] and parts[4] != "(none)":
+            for token in parts[4].split(","):
+                token = token.strip()
+                if token.endswith("/32"):
+                    try:
+                        used.add(ipaddress.ip_address(token.split("/")[0]))
+                    except Exception:
+                        pass
+    return used
+
+
+def _first_free_ip(subnet: str, used: set) -> str:
+    net = ipaddress.ip_network(subnet, strict=False)
+    # обычно .1 — сервер; начинаем с .2
+    first_host = None
+    for i, host in enumerate(net.hosts()):
+        if i == 0:
+            first_host = host  # вероятно .1
             continue
         if host not in used:
             return str(host)
     raise RuntimeError("No available IPs in subnet")
 
+
+def _sync_runtime(conf_path: str = WG_CONF) -> None:
+    # wg-quick strip + wg syncconf
+    cmd = f'sh -lc "wg-quick strip {shq(conf_path)} > /tmp/wg0.stripped && test -s /tmp/wg0.stripped && wg syncconf wg0 /tmp/wg0.stripped"'
+    rc, out, err = docker_exec(AWG_CONTAINER, cmd)
+    if rc != 0:
+        raise RuntimeError(f"syncconf failed: {err or out}")
+
+
+# ===== public API =====
+
+
+def facts() -> dict:
+    txt = docker_read_file(AWG_CONTAINER, WG_CONF)
+    port = None
+    subnet = None
+    dns = None
+    endpoint = None
+    if txt:
+        iface = _parse_interface_from_conf(txt)
+        port = iface.get("ListenPort")
+        # Address может быть списком, берём первый
+        addr = iface.get("Address")
+        if addr:
+            subnet = addr.split(",")[0].strip()
+        dns = iface.get("DNS")
+        endpoint = iface.get("Endpoint")
+    return {"port": port, "subnet": subnet, "dns": dns, "endpoint": endpoint}
+
+
+def list_profiles() -> List[dict]:
+    ct = _ensure_clients_table_dict()
+    dump = _wg_dump()
+    allowed_by_pub: Dict[str, str] = {}
+    for line in dump[1:]:
+        parts = line.split("\t")
+        if len(parts) >= 5:
+            allowed_by_pub[parts[0]] = parts[4] or "(none)"
+
+    profiles: List[dict] = []
+    for pub, data in ct.items():
+        data = data or {}
+        ud = data.get("userData", {}) or {}
+        ai = data.get("addInfo", {}) or {}
+        ip = ud.get("ip")
+        profiles.append(
+            {
+                "uuid": ai.get("uuid"),
+                "clientId": pub,
+                "name": ud.get("clientName") or ud.get("name"),
+                "allowed_ips": allowed_by_pub.get(pub, "(none)"),
+                "deleted": bool(ai.get("deleted") or data.get("deleted")),
+                "owner_tid": ai.get("owner_tid"),
+                "userData": ud,
+                "addInfo": ai,
+            }
+        )
+    return profiles
+
+
 def create_profile(profile_data: dict) -> str:
-    log.info(f"Creating new AWG profile for {profile_data.get('name')} (owner_tid={profile_data.get('owner_tid')})")
-    clients = _read_clients_table()
-    facts_data = facts()
-    subnet = facts_data.get("subnet", "10.10.0.0/24")
-    # Generate keys and IP
-    priv, pub = _generate_wg_keypair()
-    psk = _generate_psk()
-    ip = _get_next_ip(clients, subnet)
-    # Build client entry
-    client_uuid = str(uuidlib.uuid4())
+    # читаем интерфейс
+    conf_text = docker_read_file(AWG_CONTAINER, WG_CONF) or ""
+    iface = _parse_interface_from_conf(conf_text)
+    subnet = None
+    addr = iface.get("Address")
+    if addr:
+        subnet = addr.split(",")[0].strip()
+    if not subnet:
+        raise RuntimeError("Cannot determine subnet from wg0.conf [Interface]/Address")
+
+    # таблица клиентов (dict)
+    ct = _ensure_clients_table_dict()
+
+    # ключи и psk в контейнере
+    priv, pub = _gen_wg_keypair()
+    psk = _gen_psk()
+
+    # свободный IP
+    used = _occupied_ips(ct)
+    ip = _first_free_ip(subnet, used)
+
+    # запись в таблицу
+    import uuid as _uuid
+
+    client_uuid = str(_uuid.uuid4())
     user_data = {
-        "clientName": profile_data.get("name", f"peer-{client_uuid[:8]}"),
+        "clientName": profile_data.get("name") or f"peer-{client_uuid[:8]}",
         "privateKey": priv,
         "psk": psk,
         "ip": ip,
-        "created": datetime.utcnow().isoformat() + "Z",
+        "created": _now_iso(),
     }
     add_info = {
         "uuid": client_uuid,
-        "owner_tid": profile_data.get("owner_tid", ""),
+        "owner_tid": profile_data.get("owner_tid"),
         "deleted": False,
-        "created": datetime.utcnow().isoformat() + "Z",
+        "created_at": _now_iso(),
+        "source": "bot",
     }
-    client = {
-        "clientId": pub,
-        "userData": user_data,
-        "addInfo": add_info,
-    }
-    clients.append(client)
-    _write_clients_table(clients)
-    _sync_wg_conf()
-    log.info(f"Created AWG profile {client_uuid} with IP {ip}")
+    ct[pub] = {"userData": user_data, "addInfo": add_info}
+    _write_json_to_container(CLIENTS_TABLE, ct)
+
+    # пересобираем конфиг из интерфейса и таблицы
+    new_conf = _build_conf_from_clients(iface, ct)
+    docker_write_file_atomic(AWG_CONTAINER, WG_CONF, new_conf)
+    _sync_runtime(WG_CONF)
+
+    log.info({"event": "awg_created", "uuid": client_uuid, "ip": ip})
     return client_uuid
 
+
 def find_profile_by_uuid(uuid: str) -> Optional[dict]:
-    profiles = list_profiles()
-    for profile in profiles:
-        if profile.get("uuid") == uuid:
-            return profile
+    for p in list_profiles():
+        if p.get("uuid") == uuid:
+            return p
     return None
 
-def delete_profile_by_uuid(uuid: str) -> bool:
-    clients = _read_clients_table()
-    found = False
-    for client in clients:
-        add_info = client.get("addInfo", {})
-        if add_info.get("uuid") == uuid and not add_info.get("deleted", False):
-            add_info["deleted"] = True
-            add_info["deleted_at"] = datetime.utcnow().isoformat() + "Z"
-            found = True
-    if found:
-        _write_clients_table(clients)
-        _sync_wg_conf()
-        log.info(f"Profile {uuid} marked as deleted")
-    else:
-        log.warning(f"Attempted to delete nonexistent or already deleted profile {uuid}")
-    return found
 
-def facts() -> dict:
-    # Read the [Interface] section from wg0.conf
-    port = None
-    address = None
-    dns = None
-    endpoint = None
-    subnet = None
-    with open(WG_CONF, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    for line in lines:
-        l = line.strip()
-        if l.startswith("ListenPort"):
-            port = l.split("=")[1].strip()
-        elif l.startswith("Address"):
-            address = l.split("=")[1].strip()
-            # try to extract subnet (just pick the first one)
-            if "/" in address:
-                subnet = address.split(",")[0].strip()
-        elif l.startswith("DNS"):
-            dns = l.split("=")[1].strip()
-        elif l.startswith("Endpoint"):
-            endpoint = l.split("=")[1].strip()
-    return {
-        "port": port,
-        "subnet": subnet,
-        "dns": dns,
-        "endpoint": endpoint,
-    }
+def delete_profile_by_uuid(uuid: str) -> bool:
+    ct = _ensure_clients_table_dict()
+    target_pub = None
+    changed = False
+
+    # помечаем deleted и находим pubkey
+    for pub, data in ct.items():
+        ai = (data or {}).get("addInfo", {}) or {}
+        if ai.get("uuid") == uuid and not ai.get("deleted"):
+            ai["deleted"] = True
+            ai["deleted_at"] = _now_iso()
+            data["addInfo"] = ai
+            ct[pub] = data
+            target_pub = pub
+            changed = True
+            break
+
+    if not changed:
+        return False
+
+    _write_json_to_container(CLIENTS_TABLE, ct)
+
+    # пересобрать конфиг без этого peer
+    conf_text = docker_read_file(AWG_CONTAINER, WG_CONF) or ""
+    iface = _parse_interface_from_conf(conf_text)
+    new_conf = _build_conf_from_clients(iface, ct)
+    docker_write_file_atomic(AWG_CONTAINER, WG_CONF, new_conf)
+    _sync_runtime(WG_CONF)
+
+    log.info({"event": "awg_deleted", "uuid": uuid, "pub": target_pub})
+    return True
