@@ -96,7 +96,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from util import XRAY_CONNECT_HOST, AWG_CONNECT_HOST
+from services.util import XRAY_CONNECT_HOST, AWG_CONNECT_HOST
 from features.status.render import render_status_full, build_status_kb
 from features.admin.users import (
     show_admin_user_list,
@@ -158,8 +158,8 @@ from core.status_probe import (
     status_probe,
 )
 from core.decorators import log_command, admin_only, with_request_id
-import xray as XR
-import awg as AWG
+from core import repo_awg as AWG
+from core import repo_xray as XR
 
 
 # --- а теперь читаем переменные с fallback ---
@@ -1251,18 +1251,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ptype == "xray":
                 ok = XR.remove_user_by_name(u.id, pname)
             elif ptype in ("amneziawg", "awg"):
-                # Удаляем peer по IP из state
-                ip_cidr = None
-                for p in user.get("profiles", []):
-                    if p.get("name") == pname and p.get("type") in ("amneziawg", "awg") and not p.get("deleted"):
-                        ip_cidr = p.get("assigned_ip") or ""
-                        break
-                if ip_cidr:
-                    try:
-                        res = AWG.remove_peer_by_ip(ip_cidr)
-                        ok = res.get("removed_count", 0) > 0
-                    except Exception:
-                        ok = False
+                prof = next((p for p in profiles_active(user) if p["name"] == pname and p["type"] in ("amneziawg", "awg")), None)
+                if prof and prof.get("uuid"):
+                    ok = AWG.delete_profile_by_uuid(prof["uuid"])
                 else:
                     ok = False
         except Exception:
@@ -1762,7 +1753,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         break
                 if ip_cidr:
                     try:
-                        AWG.remove_peer_by_ip(ip_cidr)
+                        AWG.delete_profile_by_uuid(p.get("uuid"))
                     except Exception:
                         pass
         except Exception:
@@ -2152,24 +2143,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_app_picker(update, context, name, for_edit=True)
 
             elif typ in ("amneziawg", "awg"):
-                # Создаём peer с авто-IP и одновременно фиксируем запись в clientsTable через meta
-                prof_uuid = str(uuid.uuid4())
-                email = f"{u.id}.{name}@bot"
-                meta = {
-                    "clientName": name,
-                    "email": email,
-                    "uuid": prof_uuid,
-                    "created_at": now_iso(),
-                    "deleted": False,
-                    "deleted_at": None,
-                }
-                res = AWG.create_peer_with_generated_keys_auto(meta=meta)
+                meta = {"name": name, "owner_tid": u.id}
+                prof_uuid = AWG.create_profile(meta)
+                profile = AWG.find_profile_by_uuid(prof_uuid)
+                facts_data = AWG.facts()
+
                 created = {
-                    "email": email,
-                    "vpn_url": res.get("client_conf", ""),  # это текст .conf для импорта в Amnezia
-                    "endpoint": res.get("endpoint", ""),
-                    "assigned_ip": res.get("assigned_ip", ""),
-                    "pubkey": res.get("client_public", ""),
+                    "vpn_url": (
+                        f"[Interface]\nAddress = {profile['userData']['ip']}/32\n"
+                        f"PrivateKey = {profile['userData']['privateKey']}\n"
+                        f"DNS = {facts_data.get('dns')}\n"
+                        f"[Peer]\nPublicKey = {profile['clientId']}\n"
+                        f"Endpoint = {facts_data.get('endpoint')}:{facts_data.get('port')}\n"
+                        f"PresharedKey = {profile['userData']['psk']}\n"
+                    ),
+                    "endpoint": f"{facts_data.get('endpoint')}:{facts_data.get('port')}",
+                    "assigned_ip": f"{profile['userData']['ip']}/32",
+                    "pubkey": profile["clientId"],
                     "uuid": prof_uuid,
                 }
                 # Stage 0 freeze: не пишем профили в state.json
