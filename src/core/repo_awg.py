@@ -219,11 +219,20 @@ def _name_in_use_for_owner(owner_tid: int, name: str) -> bool:
 
 
 def facts() -> dict:
-    """Извлекает параметры интерфейса из wg0.conf внутри контейнера."""
-    port = None
-    subnet = None
+    """
+    Возвращает информацию из [Interface] wg0.conf:
+    - listen_port: int | None
+    - addresses: List[str] (как в конфиге, CIDR)
+    - server_ip: str | None (первый IP без маски, если из Address можно извлечь)
+    - subnet: str | None (первый CIDR из Address)
+    - dns: str | None
+    - endpoint: str | None
+    """
+    listen_port = None
+    addresses: list[str] = []
     dns = None
     endpoint = None
+
     try:
         lines = docker_read_file(AWG_CONTAINER, AWG_CONFIG_PATH).splitlines()
     except Exception:
@@ -231,18 +240,43 @@ def facts() -> dict:
 
     for line in lines:
         l = line.strip()
+        if not l or l.startswith("#") or l.startswith(";"):
+            continue
         if l.startswith("ListenPort"):
-            port = l.split("=")[1].strip()
+            try:
+                listen_port = int(l.split("=", 1)[1].strip())
+            except Exception:
+                listen_port = None
         elif l.startswith("Address"):
-            addr = l.split("=")[1].strip()
-            if "/" in addr:
-                subnet = addr.split(",")[0].strip()
+            # Address = ip1/mask, ip2/mask, ...
+            val = l.split("=", 1)[1].strip()
+            for chunk in val.split(","):
+                c = chunk.strip()
+                if c:
+                    addresses.append(c)
         elif l.startswith("DNS"):
-            dns = l.split("=")[1].strip()
+            dns = l.split("=", 1)[1].strip()
         elif l.startswith("Endpoint"):
-            endpoint = l.split("=")[1].strip()
+            endpoint = l.split("=", 1)[1].strip()
 
-    return {"port": port, "subnet": subnet, "dns": dns, "endpoint": endpoint}
+    subnet = addresses[0] if addresses else None
+
+    # Попробуем вытащить "server_ip" из первого CIDR (если там ip/mask)
+    server_ip = None
+    if subnet and "/" in subnet:
+        try:
+            server_ip = subnet.split("/", 1)[0]
+        except Exception:
+            server_ip = None
+
+    return {
+        "listen_port": listen_port,
+        "addresses": addresses,
+        "server_ip": server_ip,
+        "subnet": subnet,
+        "dns": dns,
+        "endpoint": endpoint,
+    }
 
 
 def _apply_runtime_sync() -> None:
@@ -289,7 +323,7 @@ def _wait_peer_in_dump(pubkey: str, attempts: int = 10, sleep_s: float = 0.2) ->
 
 
 def _sync_wg_conf_from_table() -> None:
-    """Перестраивает wg0.conf на основе clientsTable."""
+    """Перестраивает wg0.conf на основе clientsTable (игнорируя deleted=True)."""
     clients = _read_clients_table()
     try:
         base_lines = docker_read_file(AWG_CONTAINER, AWG_CONFIG_PATH).splitlines()
@@ -303,8 +337,11 @@ def _sync_wg_conf_from_table() -> None:
             break
         conf_lines.append(line)
 
-    # добавляем живые peers (без фильтрации по deleted)
+    # добавляем ТОЛЬКО живые peers (deleted=True пропускаем)
     for client in clients:
+        ai = client.get("addInfo") or {}
+        if ai.get("deleted") is True:
+            continue
         ud = client.get("userData", {}) or {}
         cid = client.get("clientId")
         ip = ud.get("ip")
@@ -320,8 +357,6 @@ def _sync_wg_conf_from_table() -> None:
     docker_write_file_atomic(
         AWG_CONTAINER, AWG_CONFIG_PATH, "\n".join(conf_lines) + "\n"
     )
-
-    # применяем конфиг в рантайме
     _apply_runtime_sync()
 
 
