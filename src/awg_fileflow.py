@@ -271,30 +271,37 @@ def get_dns_ip() -> str:
     if AWG_DNS_IP_OVERRIDE and _IPV4_RE.match(AWG_DNS_IP_OVERRIDE):
         return AWG_DNS_IP_OVERRIDE
 
-    # 1) glibc: ahostsv4
+    # Strategy 1: getent ahostsv4 — parse first token in Python
     try:
-        rc, out, _ = _sh("getent ahostsv4 amnezia-dns 2>/dev/null | awk 'NR==1{print $1}' || true", timeout=3)
-        ip = (out or "").strip()
-        if _IPV4_RE.match(ip):
-            return ip
+        rc, out, _ = _sh("getent ahostsv4 amnezia-dns 2>/dev/null || true", timeout=3)
+        text = (out or "").strip()
+        if text:
+            ip = text.split()[0]
+            if _IPV4_RE.match(ip):
+                return ip
     except Exception:
         pass
 
-    # 2) classic hosts
+    # Strategy 2: getent hosts — parse first token in Python
     try:
-        rc, out, _ = _sh("getent hosts amnezia-dns 2>/dev/null | awk 'NR==1{print $1}' || true", timeout=3)
-        ip = (out or "").strip()
-        if _IPV4_RE.match(ip):
-            return ip
+        rc, out, _ = _sh("getent hosts amnezia-dns 2>/dev/null || true", timeout=3)
+        text = (out or "").strip()
+        if text:
+            ip = text.split()[0]
+            if _IPV4_RE.match(ip):
+                return ip
     except Exception:
         pass
 
-    # 3) BusyBox ping output: PING amnezia-dns (172.x.x.x)
+    # Strategy 3: BusyBox ping — parse (IP) from first line
     try:
-        rc, out, _ = _sh("ping -c1 -W1 amnezia-dns 2>/dev/null | awk -F'[()]' 'NR==1{print $2; exit}' || true", timeout=3)
-        ip = (out or "").strip()
-        if _IPV4_RE.match(ip):
-            return ip
+        rc, out, _ = _sh("ping -c1 -W1 amnezia-dns 2>/dev/null || true", timeout=3)
+        text = (out or "").strip()
+        if text:
+            import re as _re
+            m = _re.search(r"\((\d{1,3}(?:\.\d{1,3}){3})\)", text)
+            if m:
+                return m.group(1)
     except Exception:
         pass
 
