@@ -322,31 +322,35 @@ def _read_conf() -> str:
 
 
 def _write_conf_text_atomic(conf_text: str) -> None:
+    # sanity
     if "[Interface]" not in conf_text:
         raise RuntimeError("Refusing to write conf_text without [Interface]")
     conf_text = conf_text.replace("\r\n", "\n").replace("\r", "\n")
     if not conf_text.endswith("\n"):
         conf_text += "\n"
 
-    encoded = base64.b64encode(conf_text.encode("utf-8")).decode("ascii")
     tmp_new = f"{CONF_DIR}/{WG_IFACE}.conf.new"
 
+    # 1) Пишем .new через here-doc, без base64
+    # важно: делаем '<<'EOF'' (single-quoted), чтобы без подстановок
     _require_ok(
-        "set -e; umask 077; "
-        f"cat > {tmp_new}.b64 <<B64\n{encoded}\nB64\n"
-        f"base64 -d {tmp_new}.b64 > {tmp_new} && rm -f {tmp_new}.b64",
+        "set -e; umask 077; " f"cat > {tmp_new} <<'EOF'\n{conf_text}EOF\n",
         timeout=30,
     )
     _secure_conf_perms()
 
+    # 2) sanity: .new не пуст
     sz = int(_require_ok(f"stat -c %s {tmp_new}", timeout=10))
     if sz < 40:
         sha = _require_ok(f"sha256sum {tmp_new} | awk '{{print $1}}'", timeout=10)
         raise RuntimeError(f"tmp_new looks empty: size={sz}, sha256={sha}")
 
+    # 3) Подменяем и применяем конфиг.
+    # Используем flock, если он есть; иначе — best effort без него.
     cmd = f"""
 set -e
-flock -x {LOCK_PATH} -c '
+if command -v flock >/dev/null 2>&1; then
+  flock -x {LOCK_PATH} -c '
     mv -f {tmp_new} {CONF_PATH}
     chown root:root {CONF_PATH} 2>/dev/null || true
     chmod 600 {CONF_PATH} 2>/dev/null || true
@@ -354,10 +358,20 @@ flock -x {LOCK_PATH} -c '
     wg-quick strip "{CONF_PATH}" > /tmp/{WG_IFACE}.stripped
     test -s /tmp/{WG_IFACE}.stripped
     wg syncconf {WG_IFACE} /tmp/{WG_IFACE}.stripped
-'
+  '
+else
+  mv -f {tmp_new} {CONF_PATH}
+  chown root:root {CONF_PATH} 2>/dev/null || true
+  chmod 600 {CONF_PATH} 2>/dev/null || true
+  chmod 700 {CONF_DIR} 2>/dev/null || true
+  wg-quick strip "{CONF_PATH}" > /tmp/{WG_IFACE}.stripped
+  test -s /tmp/{WG_IFACE}.stripped
+  wg syncconf {WG_IFACE} /tmp/{WG_IFACE}.stripped
+fi
 """
     _require_ok(cmd, timeout=60)
 
+    # 4) post-check
     rsz = int(_require_ok(f"stat -c %s {CONF_PATH}", timeout=10))
     if rsz < 40:
         sha = _require_ok(f"sha256sum {CONF_PATH} | awk '{{print $1}}'", timeout=10)
