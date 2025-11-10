@@ -4,7 +4,7 @@ import os, re, time, uuid
 from functools import wraps
 from typing import Optional
 
-from logger_setup import get_logger
+from services.logger_setup import get_logger
 
 logger = get_logger()
 

@@ -11,19 +11,8 @@ import json
 from datetime import datetime, timezone
 import time
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Imports that work both when this file is imported as a top-level module
-# (e.g. "import awg_fileflow") and when imported as part of the package
-# (e.g. "from src.awg_fileflow import ...").
-# ─────────────────────────────────────────────────────────────────────────────
-try:
-    # when used as a package: `from src.awg_fileflow import ...`
-    from .core.docker import run_cmd  # type: ignore
-    from .util import AWG_CONNECT_HOST  # type: ignore
-except Exception:
-    # when used as a top-level module: `import awg_fileflow`
-    from core.docker import run_cmd  # type: ignore
-    from util import AWG_CONNECT_HOST  # type: ignore
+from core.docker import run_cmd
+from services.util import AWG_CONNECT_HOST
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Paths & constants (compatible with your stack)
@@ -1069,7 +1058,7 @@ def create_peer_with_generated_keys(ip_cidr: str, meta: Optional[Dict[str, Any]]
 
     client_conf = make_client_conf_text(cli_priv, ip_cidr)
 
-        # Record into clientsTable with extended metadata (non-fatal on error)
+    # Record into clientsTable with extended metadata (non-fatal on error)
     client_name = (meta or {}).get("clientName") or (meta or {}).get("name") or ip_cidr
     email = (meta or {}).get("email", "")
     uuid = (meta or {}).get("uuid", "")

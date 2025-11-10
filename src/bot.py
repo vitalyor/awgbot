@@ -1113,7 +1113,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 + (f"• Endpoint: <code>{ep}</code>\n" if ep else "")
                 + (f"• Port: <code>{listen_port}</code>\n" if listen_port else "")
             )
-            await edit_or_send(update, context, text or "AmneziaWG", kb, parse_mode="HTML")
+            await edit_or_send(
+                update, context, text or "AmneziaWG", kb, parse_mode="HTML"
+            )
             return
 
     if data.startswith("prof_get_vpn:"):
@@ -1251,7 +1253,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ptype == "xray":
                 ok = XR.remove_user_by_name(u.id, pname)
             elif ptype in ("amneziawg", "awg"):
-                prof = next((p for p in profiles_active(user) if p["name"] == pname and p["type"] in ("amneziawg", "awg")), None)
+                prof = next(
+                    (
+                        p
+                        for p in profiles_active(user)
+                        if p["name"] == pname and p["type"] in ("amneziawg", "awg")
+                    ),
+                    None,
+                )
                 if prof and prof.get("uuid"):
                     ok = AWG.delete_profile_by_uuid(prof["uuid"])
                 else:
@@ -1748,7 +1757,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 st = load_state()
                 urec = st["users"].get(tid, {})
                 for p in urec.get("profiles", []):
-                    if p.get("name") == pname and p.get("type") in ("amneziawg", "awg") and not p.get("deleted"):
+                    if (
+                        p.get("name") == pname
+                        and p.get("type") in ("amneziawg", "awg")
+                        and not p.get("deleted")
+                    ):
                         ip_cidr = p.get("assigned_ip") or ""
                         break
                 if ip_cidr:
@@ -2163,7 +2176,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "uuid": prof_uuid,
                 }
                 # Stage 0 freeze: не пишем профили в state.json
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="menu")]])
+                kb = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ В меню", callback_data="menu")]]
+                )
                 try:
                     await update.message.delete()
                 except Exception:

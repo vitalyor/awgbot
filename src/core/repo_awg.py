@@ -6,6 +6,8 @@ import fcntl
 import uuid as uuidlib
 from typing import List, Optional
 from datetime import datetime
+from services.logger_setup import get_logger
+log = get_logger("core.repo_awg")
 
 BASE_PATH = "/opt/amnezia/awg"
 LOCKS_PATH = os.path.join(BASE_PATH, "locks")
@@ -39,7 +41,8 @@ def _read_clients_table():
     try:
         with open(CLIENTS_TABLE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        log.warning(f"Failed to read clientsTable: {e}")
         return []
 
 def _write_clients_table(clients_data):
@@ -49,6 +52,7 @@ def _write_clients_table(clients_data):
         _atomic_write_json(CLIENTS_TABLE, clients_data)
 
 def _sync_wg_conf():
+    log.debug("Regenerating wg0.conf from clientsTable...")
     # Re-generate wg0.conf from clientsTable and call wg syncconf
     clients = _read_clients_table()
     # Read base config (interface section)
@@ -83,6 +87,7 @@ def _sync_wg_conf():
     # Atomically move and syncconf
     os.rename(tmp_conf, WG_CONF)
     subprocess.run(["wg", "syncconf", "wg0", WG_CONF], check=True)
+    log.info("wg0.conf successfully synchronized.")
 
 def _get_wg_dump():
     try:
@@ -125,11 +130,13 @@ def list_profiles() -> List[dict]:
     return profiles
 
 def _generate_wg_keypair():
+    log.debug("Generating WireGuard keypair")
     priv = subprocess.check_output(["wg", "genkey"]).decode().strip()
     pub = subprocess.check_output(["wg", "pubkey"], input=priv.encode()).decode().strip()
     return priv, pub
 
 def _generate_psk():
+    log.debug("Generating preshared key")
     return subprocess.check_output(["wg", "genpsk"]).decode().strip()
 
 def _get_next_ip(clients, subnet):
@@ -149,6 +156,7 @@ def _get_next_ip(clients, subnet):
     raise RuntimeError("No available IPs in subnet")
 
 def create_profile(profile_data: dict) -> str:
+    log.info(f"Creating new AWG profile for {profile_data.get('name')} (owner_tid={profile_data.get('owner_tid')})")
     clients = _read_clients_table()
     facts_data = facts()
     subnet = facts_data.get("subnet", "10.10.0.0/24")
@@ -179,6 +187,7 @@ def create_profile(profile_data: dict) -> str:
     clients.append(client)
     _write_clients_table(clients)
     _sync_wg_conf()
+    log.info(f"Created AWG profile {client_uuid} with IP {ip}")
     return client_uuid
 
 def find_profile_by_uuid(uuid: str) -> Optional[dict]:
@@ -200,6 +209,9 @@ def delete_profile_by_uuid(uuid: str) -> bool:
     if found:
         _write_clients_table(clients)
         _sync_wg_conf()
+        log.info(f"Profile {uuid} marked as deleted")
+    else:
+        log.warning(f"Attempted to delete nonexistent or already deleted profile {uuid}")
     return found
 
 def facts() -> dict:

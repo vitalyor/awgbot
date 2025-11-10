@@ -8,17 +8,28 @@ from telegram.ext import ContextTypes
 
 from core.ui import edit_or_send
 from core.state import load_state, save_state, now_iso
-import xray as XR
-import awg as AWG
+from core import repo_awg as AWG
+from core import repo_xray as XR
 
 # --- helpers (локальные, без зависимости от bot.py) ---
+
 
 def _profiles_active(user: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [p for p in user.get("profiles", []) if not p.get("deleted")]
 
-def _xray_status_for_user(user_rec: Dict[str, Any], tg_id: int, pname: str) -> tuple[str, str]:
+
+def _xray_status_for_user(
+    user_rec: Dict[str, Any], tg_id: int, pname: str
+) -> tuple[str, str]:
     """Возвращает ("active"|"suspended"|"absent", удобочитаемая метка)."""
-    pr = next((p for p in _profiles_active(user_rec) if p.get("type") == "xray" and p.get("name") == pname), None)
+    pr = next(
+        (
+            p
+            for p in _profiles_active(user_rec)
+            if p.get("type") == "xray" and p.get("name") == pname
+        ),
+        None,
+    )
     if not pr:
         return ("absent", "Отсутствует ⚠️")
     if pr.get("suspended"):
@@ -29,7 +40,9 @@ def _xray_status_for_user(user_rec: Dict[str, Any], tg_id: int, pname: str) -> t
     except Exception:
         return ("absent", "Отсутствует ⚠️")
 
+
 # --- экспортируемые вьюхи ---
+
 
 async def show_admin_user_list(
     update: Update,
@@ -46,7 +59,13 @@ async def show_admin_user_list(
     for tid, rec in items[start:end]:
         tag = "✅" if rec.get("allowed") else "⛔"
         uname = rec.get("username") or "-"
-        rows.append([InlineKeyboardButton(f"{tag} {tid} @{uname}", callback_data=f"admin_user_open:{tid}")])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{tag} {tid} @{uname}", callback_data=f"admin_user_open:{tid}"
+                )
+            ]
+        )
 
     nav = []
     if page > 0:
@@ -62,6 +81,7 @@ async def show_admin_user_list(
     else:
         await update.effective_chat.send_message(txt, reply_markup=kb)
 
+
 async def show_admin_user_card(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -75,7 +95,9 @@ async def show_admin_user_card(
         await update.effective_chat.send_message("Пользователь не найден.")
         return
 
-    tag = "✅ Разрешить → Запретить" if rec.get("allowed") else "⛔ Запретить → Разрешить"
+    tag = (
+        "✅ Разрешить → Запретить" if rec.get("allowed") else "⛔ Запретить → Разрешить"
+    )
     lines = [
         f"<b>Пользователь</b> <code>{tid}</code>",
         f"username: <code>@{rec.get('username') or '-'}</code>",
@@ -87,7 +109,11 @@ async def show_admin_user_card(
 
     rows = [
         [InlineKeyboardButton(tag, callback_data=f"admin_user_toggle:{tid}")],
-        [InlineKeyboardButton("👤 Профили", callback_data=f"admin_user_profiles:{tid}")],
+        [
+            InlineKeyboardButton(
+                "👤 Профили", callback_data=f"admin_user_profiles:{tid}"
+            )
+        ],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_list")],
     ]
     kb = InlineKeyboardMarkup(rows)
@@ -95,11 +121,14 @@ async def show_admin_user_card(
 
     if replace and update.callback_query:
         try:
-            await update.callback_query.edit_message_text(txt, reply_markup=kb, parse_mode="HTML")
+            await update.callback_query.edit_message_text(
+                txt, reply_markup=kb, parse_mode="HTML"
+            )
             return
         except Exception:
             pass
     await edit_or_send(update, context, txt, kb, parse_mode="HTML")
+
 
 async def show_admin_user_profiles(
     update: Update,
@@ -110,14 +139,28 @@ async def show_admin_user_profiles(
     st = load_state()
     urec = st.get("users", {}).get(tid)
     if not urec:
-        await edit_or_send(update, context, "Пользователь не найден.", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_list")]]))
+        await edit_or_send(
+            update,
+            context,
+            "Пользователь не найден.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="admin_list")]]
+            ),
+        )
         return
 
     act = _profiles_active(urec)
     rows = []
     if not act:
-        rows = [[InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_user_open:{tid}")]]
-        await edit_or_send(update, context, "У пользователя нет активных конфигураций.", InlineKeyboardMarkup(rows))
+        rows = [
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_user_open:{tid}")]
+        ]
+        await edit_or_send(
+            update,
+            context,
+            "У пользователя нет активных конфигураций.",
+            InlineKeyboardMarkup(rows),
+        )
         return
 
     for p in act:
@@ -127,7 +170,13 @@ async def show_admin_user_profiles(
             left = f"{name} · {'▶️' if status=='active' else '⏸' if status=='suspended' else '⚠️'}"
         else:
             left = f"{name} · {ptype}"
-        rows.append([InlineKeyboardButton(left, callback_data=f"admin_prof_open:{tid}:{name}:{ptype}")])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    left, callback_data=f"admin_prof_open:{tid}:{name}:{ptype}"
+                )
+            ]
+        )
 
     # --- массовые действия по Xray (если есть такие профили) ---
     xray_profiles = [p for p in act if p.get("type") == "xray"]
@@ -158,10 +207,15 @@ async def show_admin_user_profiles(
             )
         if mass_row:
             rows.append(mass_row)
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_user_open:{tid}")])
+    rows.append(
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_user_open:{tid}")]
+    )
     kb = InlineKeyboardMarkup(rows)
-    txt = f"Конфигурации пользователя <code>{tid}</code>" + (f"\n\n{note}" if note else "")
+    txt = f"Конфигурации пользователя <code>{tid}</code>" + (
+        f"\n\n{note}" if note else ""
+    )
     await edit_or_send(update, context, txt, kb, parse_mode="HTML")
+
 
 async def show_admin_profile_card(
     update: Update,
@@ -173,7 +227,14 @@ async def show_admin_profile_card(
 ):
     st = load_state()
     urec = st.get("users", {}).get(tid, {})
-    pr = next((p for p in _profiles_active(urec) if p.get("name") == pname and p.get("type") == ptype), None)
+    pr = next(
+        (
+            p
+            for p in _profiles_active(urec)
+            if p.get("name") == pname and p.get("type") == ptype
+        ),
+        None,
+    )
     if not pr:
         await show_admin_user_profiles(update, context, tid, note="Профиль не найден.")
         return
@@ -196,11 +257,37 @@ async def show_admin_profile_card(
 
         rows = []
         if status == "active":
-            rows.append([InlineKeyboardButton("⏸ Приостановить", callback_data=f"admin_prof_suspend:{tid}:{pname}")])
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "⏸ Приостановить",
+                        callback_data=f"admin_prof_suspend:{tid}:{pname}",
+                    )
+                ]
+            )
         else:
-            rows.append([InlineKeyboardButton("▶️ Возобновить", callback_data=f"admin_prof_resume:{tid}:{pname}")])
-        rows.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"admin_prof_del:{tid}:{pname}:{ptype}")])
-        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_user_profiles:{tid}")])
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "▶️ Возобновить",
+                        callback_data=f"admin_prof_resume:{tid}:{pname}",
+                    )
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🗑 Удалить", callback_data=f"admin_prof_del:{tid}:{pname}:{ptype}"
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад", callback_data=f"admin_user_profiles:{tid}"
+                )
+            ]
+        )
         kb = InlineKeyboardMarkup(rows)
         await edit_or_send(update, context, "\n".join(lines), kb, parse_mode="HTML")
         return
@@ -208,7 +295,12 @@ async def show_admin_profile_card(
     if ptype in ("amneziawg", "awg"):
         info = AWG.find_user(int(tid), pname)
         if not info:
-            await show_admin_user_profiles(update, context, tid, note="Конфигурация AmneziaWG не найдена на сервере.")
+            await show_admin_user_profiles(
+                update,
+                context,
+                tid,
+                note="Конфигурация AmneziaWG не найдена на сервере.",
+            )
             return
         lines = [
             f"<b>{pname}</b> · AmneziaWG",
@@ -218,8 +310,16 @@ async def show_admin_profile_card(
         if note:
             lines += ["", note]
         rows = [
-            [InlineKeyboardButton("🗑 Удалить", callback_data=f"admin_prof_del:{tid}:{pname}:{ptype}")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_user_profiles:{tid}")],
+            [
+                InlineKeyboardButton(
+                    "🗑 Удалить", callback_data=f"admin_prof_del:{tid}:{pname}:{ptype}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад", callback_data=f"admin_user_profiles:{tid}"
+                )
+            ],
         ]
         kb = InlineKeyboardMarkup(rows)
         await edit_or_send(update, context, "\n".join(lines), kb, parse_mode="HTML")
