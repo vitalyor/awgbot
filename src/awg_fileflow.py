@@ -330,7 +330,11 @@ def _write_conf_text_atomic(conf_text: str) -> None:
     tmp_stripped = f"/tmp/{WG_IFACE}.stripped"
 
     # 1) Сразу декодируем В .new одной командой (меньше шансов на нули)
-    _require_ok("set -e; umask 077; " f"base64 -d > {tmp_new} <<'B64'\n{encoded}\nB64")
+    _require_ok(
+        "set -e; umask 077; "
+        f"cat > {tmp_new}.b64 <<B64\n{encoded}\nB64\n"
+        f"base64 -d {tmp_new}.b64 > {tmp_new} && rm -f {tmp_new}.b64"
+    )
     _secure_conf_perms()
 
     # 2) Мини-диагностика: убедимся, что .new не пуст
